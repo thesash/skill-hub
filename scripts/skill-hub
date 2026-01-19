@@ -26,7 +26,6 @@ Commands:
     init                Initialize ~/.skill-hub/ data directory
     new <name>          Create a new skill from template
     status              Show current skill distribution status
-    matrix              Interactive skill × agent matrix (arrows, space, enter)
     i, interactive      Interactive menu (requires gum)
     list                List all skills
     sync [agent]        Apply config to filesystem (create/update symlinks)
@@ -821,229 +820,6 @@ reset_agent() {
 }
 
 #================================================================================
-# Interactive Matrix (full TUI)
-#================================================================================
-
-interactive_matrix() {
-    # Check for terminal
-    if [ ! -t 0 ]; then
-        echo "Error: Interactive matrix requires a terminal"
-        return 1
-    fi
-
-    # Load data
-    local skills=()
-    while IFS= read -r skill; do
-        skills+=("$skill")
-    done < <(get_all_skills)
-    local num_skills=${#skills[@]}
-
-    local agents=()
-    local agent_paths=()
-    while IFS= read -r line || [ -n "$line" ]; do
-        parsed=$(parse_config_line "$line") || continue
-        IFS=: read -r name path _ <<< "$parsed"
-        agents+=("$name")
-        agent_paths+=("$path")
-    done < "$CONFIG_FILE"
-    local num_agents=${#agents[@]}
-
-    # Build state matrix (skill_index,agent_index -> 0/1)
-    # Using a flat array: index = skill_idx * num_agents + agent_idx
-    local state=()
-    for ((s=0; s<num_skills; s++)); do
-        local skill="${skills[$s]}"
-        for ((a=0; a<num_agents; a++)); do
-            local agent="${agents[$a]}"
-            local agent_skills=$(get_agent_skills "$agent")
-            local enabled=0
-            if [ "$agent_skills" = "all" ]; then
-                enabled=1
-            elif [[ ",$agent_skills," == *",$skill,"* ]]; then
-                enabled=1
-            fi
-            state+=($enabled)
-        done
-    done
-
-    # Cursor position
-    local cur_skill=0
-    local cur_agent=0
-
-    # Column widths
-    local skill_col=22
-    local agent_col=12
-
-    # Save original state for comparison
-    local original_state=("${state[@]}")
-
-    # Helper to get/set state
-    get_state() { echo "${state[$(($1 * num_agents + $2))]}"; }
-    set_state() { state[$(($1 * num_agents + $2))]=$3; }
-    toggle_state() {
-        local idx=$(($1 * num_agents + $2))
-        if [ "${state[$idx]}" = "1" ]; then
-            state[$idx]=0
-        else
-            state[$idx]=1
-        fi
-    }
-
-    # Draw the matrix
-    draw_matrix() {
-        # Move cursor to top-left instead of clearing (prevents flicker)
-        printf "\033[H"
-        printf "\033[1m Skill Hub - Interactive Matrix\033[0m\033[K\n"
-        printf " ←→↑↓ navigate | Space toggle | Enter save | q quit\033[K\n\n"
-
-        # Header row
-        printf " %-${skill_col}s" ""
-        for ((a=0; a<num_agents; a++)); do
-            local agent="${agents[$a]}"
-            if [ $a -eq $cur_agent ]; then
-                printf "\033[1;4m%-${agent_col}s\033[0m" "$agent"
-            else
-                printf "%-${agent_col}s" "$agent"
-            fi
-        done
-        printf "\033[K\n"
-
-        # Separator
-        printf " "
-        for ((i=0; i<skill_col; i++)); do printf "─"; done
-        for ((a=0; a<num_agents; a++)); do
-            for ((i=0; i<agent_col; i++)); do printf "─"; done
-        done
-        printf "\033[K\n"
-
-        # Skill rows
-        for ((s=0; s<num_skills; s++)); do
-            local skill="${skills[$s]}"
-            local display_skill="$skill"
-            [ ${#skill} -gt $((skill_col-2)) ] && display_skill="${skill:0:$((skill_col-4))}.."
-
-            # Highlight current row
-            if [ $s -eq $cur_skill ]; then
-                printf "\033[1m %-${skill_col}s\033[0m" "$display_skill"
-            else
-                printf " %-${skill_col}s" "$display_skill"
-            fi
-
-            for ((a=0; a<num_agents; a++)); do
-                local val=$(get_state $s $a)
-                local cell=""
-                if [ "$val" = "1" ]; then
-                    cell="[✓]"
-                else
-                    cell="[ ]"
-                fi
-
-                # Highlight current cell
-                if [ $s -eq $cur_skill ] && [ $a -eq $cur_agent ]; then
-                    printf "\033[7m%-${agent_col}s\033[0m" "$cell"
-                elif [ "$val" = "1" ]; then
-                    printf "\033[32m%-${agent_col}s\033[0m" "$cell"
-                else
-                    printf "\033[90m%-${agent_col}s\033[0m" "$cell"
-                fi
-            done
-            printf "\033[K\n"
-        done
-
-        printf "\033[K\n"
-    }
-
-    # Read a single key
-    read_key() {
-        local key
-        IFS= read -rsn1 key
-        if [[ $key == $'\x1b' ]]; then
-            read -rsn2 -t 0.1 key
-            echo "$key"
-        elif [[ $key == "" ]]; then
-            echo "enter"
-        else
-            echo "$key"
-        fi
-    }
-
-    # Main loop
-    stty -echo
-    trap 'stty echo; printf "\033[?25h"' EXIT
-    printf "\033[?25l"  # Hide cursor
-    clear  # Initial clear only once
-
-    while true; do
-        draw_matrix
-        local key=$(read_key)
-
-        case "$key" in
-            "[A") # Up
-                [ $cur_skill -gt 0 ] && ((cur_skill--))
-                ;;
-            "[B") # Down
-                [ $cur_skill -lt $((num_skills-1)) ] && ((cur_skill++))
-                ;;
-            "[C") # Right
-                [ $cur_agent -lt $((num_agents-1)) ] && ((cur_agent++))
-                ;;
-            "[D") # Left
-                [ $cur_agent -gt 0 ] && ((cur_agent--))
-                ;;
-            " ") # Space - toggle
-                toggle_state $cur_skill $cur_agent
-                ;;
-            "enter")
-                # Apply changes
-                stty echo
-                printf "\033[?25h"
-                clear
-                echo "Applying changes..."
-                echo ""
-
-                for ((a=0; a<num_agents; a++)); do
-                    local agent="${agents[$a]}"
-                    local new_skills=""
-                    for ((s=0; s<num_skills; s++)); do
-                        if [ "$(get_state $s $a)" = "1" ]; then
-                            [ -n "$new_skills" ] && new_skills="$new_skills,"
-                            new_skills="$new_skills${skills[$s]}"
-                        fi
-                    done
-                    if [ -z "$new_skills" ]; then
-                        echo "Warning: $agent would have no skills, skipping"
-                    else
-                        # Check if all skills selected
-                        local all_selected=true
-                        for ((s=0; s<num_skills; s++)); do
-                            if [ "$(get_state $s $a)" = "0" ]; then
-                                all_selected=false
-                                break
-                            fi
-                        done
-                        if [ "$all_selected" = true ]; then
-                            new_skills="all"
-                        fi
-                        set_agent_skills "$agent" "$new_skills"
-                    fi
-                done
-                echo ""
-                echo "Done! Press any key to continue..."
-                read -rsn1
-                return 0
-                ;;
-            "q"|"Q")
-                stty echo
-                printf "\033[?25h"
-                clear
-                echo "Cancelled - no changes made."
-                return 0
-                ;;
-        esac
-    done
-}
-
-#================================================================================
 # Interactive TUI (requires gum)
 #================================================================================
 
@@ -1065,16 +841,12 @@ interactive() {
 
         # Main menu
         local action=$(gum choose --header "Skill Hub - What would you like to do?" \
-            "Matrix" \
             "Configure agent" \
             "Apply preset" \
             "Create preset" \
             "Exit")
 
         case "$action" in
-            "Matrix")
-                interactive_matrix
-                ;;
             "Configure agent")
                 local agent=$(gum choose --header "Select agent to configure:" "${agents[@]}")
                 [ -z "$agent" ] && continue
@@ -1160,9 +932,6 @@ case "${1:-}" in
         ;;
     status)
         status
-        ;;
-    matrix)
-        interactive_matrix
         ;;
     i|interactive)
         interactive
