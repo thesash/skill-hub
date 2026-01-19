@@ -1,0 +1,1281 @@
+#!/usr/bin/env bash
+# skill-hub - Centralized skill management for multi-agent distribution
+#
+# Data directory: ~/.skill-hub/ (or $SKILL_HUB_DATA)
+# This script manages symlinks to distribute skills to AI agents
+
+set -e
+
+# Data directory - can be overridden with SKILL_HUB_DATA env var
+SKILL_HUB_DATA="${SKILL_HUB_DATA:-$HOME/.skill-hub}"
+SKILLS_DIR="$SKILL_HUB_DATA/skills"
+AGENTS_FILE="$SKILL_HUB_DATA/agents.conf"
+PRESETS_FILE="$SKILL_HUB_DATA/presets.conf"
+
+# For backwards compatibility during migration
+SKILL_HUB="$SKILLS_DIR"
+CONFIG_FILE="$AGENTS_FILE"
+
+usage() {
+    cat <<EOF
+skill-hub - Centralized skill management
+
+Usage: skill-hub <command> [options]
+
+Commands:
+    init                Initialize ~/.skill-hub/ data directory
+    new <name>          Create a new skill from template
+    status              Show current skill distribution status
+    matrix              Interactive skill × agent matrix (arrows, space, enter)
+    i, interactive      Interactive menu (requires gum)
+    list                List all skills
+    sync [agent]        Apply config to filesystem (create/update symlinks)
+    path                Print data directory path
+
+    set <agent> <skills>
+                        Set skills for agent ("all" or comma-separated)
+    enable <agent> <skill>
+                        Add a skill to an agent
+    disable <agent> <skill>
+                        Remove a skill from an agent
+    copy <from> <to>    Copy skills from one agent to another
+    reset <agent>       Reset agent to all skills
+
+    add-agent <name> <path> [skills]
+                        Add agent target (skills: "all" or comma-separated)
+    link-project <skill> <project-path>
+                        Link a skill to a project repo
+
+    preset create <name> <skills>
+                        Create a preset skill bundle
+    preset list         List all presets
+    preset show <name>  Show skills in a preset
+    preset apply <agent> <preset>
+                        Apply preset to an agent
+    preset delete <name>
+                        Delete a preset
+
+    deps [install]      Check/install skill dependencies
+
+Data directory: $SKILL_HUB_DATA
+EOF
+}
+
+#================================================================================
+# Init & Setup
+#================================================================================
+
+init_skill_hub() {
+    if [ -d "$SKILL_HUB_DATA" ]; then
+        echo "Data directory already exists: $SKILL_HUB_DATA"
+        echo ""
+        echo "Contents:"
+        ls -la "$SKILL_HUB_DATA"
+        return 0
+    fi
+
+    echo "Creating skill-hub data directory..."
+    mkdir -p "$SKILLS_DIR"
+
+    # Create default agents config
+    cat > "$AGENTS_FILE" <<'AGENTS'
+# Skill Hub Agent Configuration
+# Format: name:path:skills
+# - name: identifier for the agent
+# - path: where skills should be symlinked
+# - skills: "all" or comma-separated list
+
+claude-code:~/.claude/skills:all
+# codex:~/.codex/skills:all
+# clawdbot:~/.clawdbot/skills:all
+AGENTS
+
+    echo "Created $SKILL_HUB_DATA"
+    echo ""
+    echo "Next steps:"
+    echo "  1. Create a skill:  skill-hub new my-first-skill"
+    echo "  2. Edit agents.conf to configure your agents"
+    echo "  3. Sync skills:     skill-hub sync"
+    echo ""
+    echo "Optional: Version control your skills"
+    echo "  cd $SKILL_HUB_DATA && git init"
+}
+
+new_skill() {
+    local name=$1
+
+    if [ -z "$name" ]; then
+        echo "Usage: skill-hub new <skill-name>"
+        return 1
+    fi
+
+    # Ensure data directory exists
+    if [ ! -d "$SKILLS_DIR" ]; then
+        echo "Data directory not found. Run 'skill-hub init' first."
+        return 1
+    fi
+
+    local skill_dir="$SKILLS_DIR/$name"
+
+    if [ -d "$skill_dir" ]; then
+        echo "Skill '$name' already exists at $skill_dir"
+        return 1
+    fi
+
+    mkdir -p "$skill_dir"
+
+    cat > "$skill_dir/SKILL.md" <<SKILL
+---
+name: $name
+description: Brief description of what this skill does
+allowed-tools: Bash, Read, Write, Edit, Glob, Grep
+---
+
+# $name
+
+Instructions for the AI agent go here.
+
+## Usage
+
+Describe how to use this skill.
+
+## Examples
+
+\`\`\`bash
+# Example commands or code
+\`\`\`
+SKILL
+
+    echo "Created skill: $skill_dir/SKILL.md"
+    echo ""
+    echo "Edit the SKILL.md file to add your skill instructions."
+    echo "Then run 'skill-hub sync' to distribute to agents."
+}
+
+print_path() {
+    echo "$SKILL_HUB_DATA"
+}
+
+get_all_skills() {
+    for skill_dir in "$SKILL_HUB"/*/; do
+        [ -d "$skill_dir" ] || continue
+        skill=$(basename "$skill_dir")
+        [[ "$skill" == .* ]] && continue
+        echo "$skill"
+    done
+}
+
+list_skills() {
+    echo "Skills in hub ($SKILL_HUB):"
+    echo ""
+    for skill_dir in "$SKILL_HUB"/*/; do
+        [ -d "$skill_dir" ] || continue
+        skill=$(basename "$skill_dir")
+        [[ "$skill" == .* ]] && continue
+
+        if [ -L "${skill_dir%/}" ]; then
+            target=$(readlink "${skill_dir%/}")
+            echo "  $skill -> $target"
+        else
+            echo "  $skill"
+        fi
+    done
+}
+
+parse_config_line() {
+    local line=$1
+    # Skip comments and empty lines
+    [[ "$line" =~ ^[[:space:]]*# ]] && return 1
+    [[ -z "${line// }" ]] && return 1
+
+    # Parse name:path:skills (skills defaults to "all")
+    IFS=: read -r name path skills <<< "$line"
+    # Expand ~ in path
+    path="${path/#\~/$HOME}"
+    skills="${skills:-all}"
+
+    echo "$name:$path:$skills"
+}
+
+status() {
+    echo "=== Skill Hub ==="
+    echo "$SKILL_HUB"
+    echo ""
+    list_skills
+    echo ""
+
+    echo "=== Agent Distribution ==="
+
+    [ ! -f "$CONFIG_FILE" ] && echo "(no config file)" && return
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        parsed=$(parse_config_line "$line") || continue
+        IFS=: read -r name path skills <<< "$parsed"
+
+        echo ""
+        echo "$name ($path)"
+        if [ "$skills" = "all" ]; then
+            echo "  skills: all"
+        else
+            echo "  skills: $skills"
+        fi
+
+        if [ -L "$path" ]; then
+            echo "  mode: directory symlink -> $(readlink "$path")"
+        elif [ -d "$path" ]; then
+            count=$(find "$path" -maxdepth 1 \( -type d -o -type l \) ! -name ".*" ! -name "$(basename "$path")" 2>/dev/null | wc -l | tr -d ' ')
+            echo "  mode: individual symlinks ($count skills)"
+        else
+            echo "  mode: (not set up)"
+        fi
+    done < "$CONFIG_FILE"
+}
+
+sync_agent() {
+    local name=$1
+    local path=$2
+    local skills=$3
+
+    echo "Syncing $name..."
+
+    if [ "$skills" = "all" ]; then
+        # Full directory symlink mode
+        if [ -L "$path" ]; then
+            target=$(readlink "$path")
+            if [ "$target" = "$SKILL_HUB" ]; then
+                echo "  Already symlinked to hub"
+                return 0
+            else
+                echo "  Updating symlink..."
+                rm "$path"
+            fi
+        elif [ -d "$path" ]; then
+            echo "  Converting to directory symlink..."
+            rm -rf "$path"
+        fi
+
+        mkdir -p "$(dirname "$path")"
+        ln -s "$SKILL_HUB" "$path"
+        echo "  Linked all skills"
+    else
+        # Individual skill symlinks mode
+        if [ -L "$path" ]; then
+            echo "  Converting from directory symlink to individual..."
+            rm "$path"
+        fi
+
+        mkdir -p "$path"
+
+        # Parse comma-separated skills
+        IFS=',' read -ra skill_list <<< "$skills"
+        for skill in "${skill_list[@]}"; do
+            skill=$(echo "$skill" | tr -d ' ')  # trim whitespace
+            src="$SKILL_HUB/$skill"
+            dst="$path/$skill"
+
+            if [ ! -e "$src" ]; then
+                echo "  WARN: $skill not found in hub"
+                continue
+            fi
+
+            if [ -L "$dst" ]; then
+                current=$(readlink "$dst")
+                if [ "$current" = "$src" ]; then
+                    echo "  $skill: ok"
+                    continue
+                fi
+                rm "$dst"
+            elif [ -e "$dst" ]; then
+                echo "  WARN: $skill exists but is not a symlink, skipping"
+                continue
+            fi
+
+            ln -s "$src" "$dst"
+            echo "  $skill: linked"
+        done
+    fi
+}
+
+sync_all() {
+    local filter=$1
+
+    [ ! -f "$CONFIG_FILE" ] && echo "No config file at $CONFIG_FILE" && return 1
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        parsed=$(parse_config_line "$line") || continue
+        IFS=: read -r name path skills <<< "$parsed"
+
+        if [ -z "$filter" ] || [ "$filter" = "$name" ]; then
+            sync_agent "$name" "$path" "$skills"
+        fi
+    done < "$CONFIG_FILE"
+}
+
+add_agent() {
+    local name=$1
+    local path=$2
+    local skills=${3:-all}
+
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    touch "$CONFIG_FILE"
+
+    # Remove existing entry
+    if grep -q "^$name:" "$CONFIG_FILE" 2>/dev/null; then
+        sed -i '' "/^$name:/d" "$CONFIG_FILE"
+    fi
+
+    echo "$name:$path:$skills" >> "$CONFIG_FILE"
+    echo "Added $name -> $path (skills: $skills)"
+    echo "Run 'skill-sync sync $name' to apply"
+}
+
+link_project() {
+    local skill=$1
+    local project_path=$2
+
+    if [ ! -d "$project_path" ]; then
+        echo "Error: $project_path does not exist"
+        return 1
+    fi
+
+    skill_path="$SKILL_HUB/$skill"
+
+    if [ -d "$skill_path" ] && [ ! -L "$skill_path" ]; then
+        echo "Backing up existing $skill to $skill.bak"
+        mv "$skill_path" "$skill_path.bak"
+    fi
+
+    [ -L "$skill_path" ] && rm "$skill_path"
+
+    ln -s "$project_path" "$skill_path"
+    echo "Linked $skill -> $project_path"
+}
+
+#================================================================================
+# Dependency Management
+#================================================================================
+
+# Extract metadata JSON from SKILL.md
+# Only matches metadata: at start of line, outside code blocks
+get_skill_metadata() {
+    local skill_md="$1"
+    # Use awk to skip content inside code blocks
+    awk '
+        /^```/ { in_code = !in_code; next }
+        !in_code && /^metadata:/ { sub(/^metadata: */, ""); print; exit }
+    ' "$skill_md" 2>/dev/null || echo "{}"
+}
+
+# Parse JSON array using bash (simple parser for our format)
+json_array_to_lines() {
+    echo "$1" | tr -d '[]"' | tr ',' '\n' | sed 's/^ *//'
+}
+
+# Check all skill dependencies
+check_deps() {
+    local do_install=${1:-false}
+    local missing_bins=()
+    local missing_env=()
+    local install_commands=()
+    local has_issues=false
+
+    echo "=== Skill Dependencies ==="
+    echo ""
+
+    for skill_dir in "$SKILL_HUB"/*/; do
+        [ -d "$skill_dir" ] || continue
+        skill=$(basename "$skill_dir")
+        [[ "$skill" == .* ]] && continue
+
+        skill_md="$skill_dir/SKILL.md"
+        [ ! -f "$skill_md" ] && continue
+
+        # Get metadata
+        metadata=$(get_skill_metadata "$skill_md")
+        [ "$metadata" = "{}" ] && continue
+
+        # Extract requires.bins using grep/sed (avoiding jq dependency)
+        bins=$(echo "$metadata" | grep -oE '"bins":\s*\[[^]]*\]' | sed 's/"bins":\s*//')
+        envs=$(echo "$metadata" | grep -oE '"env":\s*\[[^]]*\]' | sed 's/"env":\s*//')
+
+        skill_missing_bins=()
+        skill_missing_env=()
+
+        # Check binaries
+        if [ -n "$bins" ] && [ "$bins" != "[]" ]; then
+            for bin in $(json_array_to_lines "$bins"); do
+                [ -z "$bin" ] && continue
+                if ! command -v "$bin" &>/dev/null; then
+                    skill_missing_bins+=("$bin")
+                    # Extract install command for this bin
+                    install_info=$(echo "$metadata" | grep -oE '"install":\s*\[[^]]*\]' | sed 's/"install":\s*//')
+                fi
+            done
+        fi
+
+        # Check environment variables
+        if [ -n "$envs" ] && [ "$envs" != "[]" ]; then
+            for env_var in $(json_array_to_lines "$envs"); do
+                [ -z "$env_var" ] && continue
+                if [ -z "${!env_var:-}" ]; then
+                    skill_missing_env+=("$env_var")
+                fi
+            done
+        fi
+
+        # Report for this skill
+        if [ ${#skill_missing_bins[@]} -gt 0 ] || [ ${#skill_missing_env[@]} -gt 0 ]; then
+            has_issues=true
+            echo "$skill:"
+            for bin in "${skill_missing_bins[@]}"; do
+                echo "  ✗ bin: $bin"
+                missing_bins+=("$bin")
+            done
+            for env_var in "${skill_missing_env[@]}"; do
+                echo "  ✗ env: $env_var"
+                missing_env+=("$env_var")
+            done
+            echo ""
+        fi
+    done
+
+    # Check for MCP tools referenced in skills
+    echo "=== MCP Dependencies ==="
+    echo ""
+
+    local mcp_refs=$(grep -rh "mcp__" "$SKILL_HUB"/*/SKILL.md 2>/dev/null | \
+        grep -oE 'mcp__[a-zA-Z0-9_-]+__' | sed 's/__$//' | sort -u)
+
+    for mcp in $mcp_refs; do
+        mcp_name=$(echo "$mcp" | sed 's/mcp__//')
+        echo "  Referenced: $mcp_name"
+    done
+    echo ""
+    echo "  Note: MCP servers must be configured in Claude settings or via plugins"
+    echo ""
+
+    # Summary
+    echo "=== Summary ==="
+    echo ""
+
+    if [ "$has_issues" = false ]; then
+        echo "✓ All binary dependencies satisfied"
+    else
+        echo "Missing binaries: ${missing_bins[*]:-none}"
+        echo "Missing env vars: ${missing_env[*]:-none}"
+    fi
+    echo ""
+
+    # Install if requested
+    if [ "$do_install" = true ] && [ ${#missing_bins[@]} -gt 0 ]; then
+        echo "=== Installing Dependencies ==="
+        echo ""
+        install_missing_deps "${missing_bins[@]}"
+    elif [ ${#missing_bins[@]} -gt 0 ]; then
+        echo "Run 'skill-sync deps install' to install missing dependencies"
+    fi
+}
+
+install_missing_deps() {
+    local bins=("$@")
+
+    for bin in "${bins[@]}"; do
+        echo "Installing $bin..."
+        case "$bin" in
+            op)
+                brew install 1password-cli
+                ;;
+            bird)
+                brew install steipete/tap/bird
+                ;;
+            ynab)
+                npm install -g @stephendolan/ynab-cli
+                ;;
+            mcporter)
+                npm install -g mcporter
+                ;;
+            yt-dlp)
+                brew install yt-dlp
+                ;;
+            ffmpeg)
+                brew install ffmpeg
+                ;;
+            python3)
+                brew install python3
+                ;;
+            *)
+                echo "  Unknown package: $bin (try: brew install $bin)"
+                ;;
+        esac
+        echo ""
+    done
+}
+
+#================================================================================
+# Presets System
+#================================================================================
+
+preset_create() {
+    local name=$1
+    local skills=$2
+
+    # Validate skills exist
+    local valid_skills=""
+    IFS=',' read -ra skill_list <<< "$skills"
+    for skill in "${skill_list[@]}"; do
+        skill=$(echo "$skill" | tr -d ' ')
+        if [ ! -d "$SKILL_HUB/$skill" ]; then
+            echo "Warning: Skill '$skill' not found in hub, skipping"
+        else
+            [ -n "$valid_skills" ] && valid_skills="$valid_skills,"
+            valid_skills="$valid_skills$skill"
+        fi
+    done
+
+    if [ -z "$valid_skills" ]; then
+        echo "Error: No valid skills provided"
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$PRESETS_FILE")"
+    touch "$PRESETS_FILE"
+
+    # Remove existing preset with same name
+    if grep -q "^$name:" "$PRESETS_FILE" 2>/dev/null; then
+        local tmp=$(mktemp)
+        grep -v "^$name:" "$PRESETS_FILE" > "$tmp"
+        mv "$tmp" "$PRESETS_FILE"
+    fi
+
+    echo "$name:$valid_skills" >> "$PRESETS_FILE"
+    echo "Created preset '$name' with skills: $valid_skills"
+}
+
+preset_list() {
+    if [ ! -f "$PRESETS_FILE" ]; then
+        echo "No presets defined yet."
+        echo "Create one with: skill-hub preset create <name> <skills>"
+        return 0
+    fi
+
+    echo "Available presets:"
+    echo ""
+    while IFS=: read -r name skills; do
+        [[ "$name" =~ ^[[:space:]]*# ]] && continue
+        [ -z "$name" ] && continue
+        # Format skills nicely
+        local formatted=$(echo "$skills" | tr ',' ', ')
+        printf "  ${BOLD}%s${RESET}: %s\n" "$name" "$formatted"
+    done < "$PRESETS_FILE"
+    echo ""
+}
+
+preset_show() {
+    local name=$1
+
+    if [ ! -f "$PRESETS_FILE" ]; then
+        echo "Error: No presets file found"
+        return 1
+    fi
+
+    local found=false
+    while IFS=: read -r preset_name skills; do
+        if [ "$preset_name" = "$name" ]; then
+            echo "Preset: $name"
+            echo "Skills:"
+            IFS=',' read -ra skill_list <<< "$skills"
+            for skill in "${skill_list[@]}"; do
+                echo "  - $skill"
+            done
+            found=true
+            break
+        fi
+    done < "$PRESETS_FILE"
+
+    if [ "$found" = false ]; then
+        echo "Error: Preset '$name' not found"
+        preset_list
+        return 1
+    fi
+}
+
+preset_apply() {
+    local agent=$1
+    local preset_name=$2
+
+    if [ ! -f "$PRESETS_FILE" ]; then
+        echo "Error: No presets file found"
+        return 1
+    fi
+
+    local skills=""
+    while IFS=: read -r name preset_skills; do
+        if [ "$name" = "$preset_name" ]; then
+            skills="$preset_skills"
+            break
+        fi
+    done < "$PRESETS_FILE"
+
+    if [ -z "$skills" ]; then
+        echo "Error: Preset '$preset_name' not found"
+        preset_list
+        return 1
+    fi
+
+    echo "Applying preset '$preset_name' to $agent..."
+    set_agent_skills "$agent" "$skills"
+}
+
+preset_delete() {
+    local name=$1
+
+    if [ ! -f "$PRESETS_FILE" ]; then
+        echo "Error: No presets file found"
+        return 1
+    fi
+
+    if ! grep -q "^$name:" "$PRESETS_FILE"; then
+        echo "Error: Preset '$name' not found"
+        return 1
+    fi
+
+    local tmp=$(mktemp)
+    grep -v "^$name:" "$PRESETS_FILE" > "$tmp"
+    mv "$tmp" "$PRESETS_FILE"
+    echo "Deleted preset '$name'"
+}
+
+#================================================================================
+# Skill Distribution Management
+#================================================================================
+
+# Get current skills for an agent
+get_agent_skills() {
+    local agent=$1
+    while IFS= read -r line || [ -n "$line" ]; do
+        parsed=$(parse_config_line "$line") || continue
+        IFS=: read -r name path skills <<< "$parsed"
+        if [ "$name" = "$agent" ]; then
+            echo "$skills"
+            return 0
+        fi
+    done < "$CONFIG_FILE"
+    echo ""
+    return 1
+}
+
+# Get agent path
+get_agent_path() {
+    local agent=$1
+    while IFS= read -r line || [ -n "$line" ]; do
+        parsed=$(parse_config_line "$line") || continue
+        IFS=: read -r name path skills <<< "$parsed"
+        if [ "$name" = "$agent" ]; then
+            echo "$path"
+            return 0
+        fi
+    done < "$CONFIG_FILE"
+    return 1
+}
+
+# Set skills for an agent
+set_agent_skills() {
+    local agent=$1
+    local skills=$2
+
+    local path=$(get_agent_path "$agent")
+    if [ -z "$path" ]; then
+        echo "Error: Agent '$agent' not found in config"
+        echo "Available agents:"
+        while IFS= read -r line || [ -n "$line" ]; do
+            parsed=$(parse_config_line "$line") || continue
+            IFS=: read -r name _ _ <<< "$parsed"
+            echo "  - $name"
+        done < "$CONFIG_FILE"
+        return 1
+    fi
+
+    # Update config file
+    local tmp=$(mktemp)
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [[ "$line" =~ ^$agent: ]]; then
+            echo "$agent:$path:$skills"
+        else
+            echo "$line"
+        fi
+    done < "$CONFIG_FILE" > "$tmp"
+    mv "$tmp" "$CONFIG_FILE"
+
+    echo "Set $agent skills to: $skills"
+    echo ""
+    sync_agent "$agent" "$path" "$skills"
+}
+
+# Enable a skill for an agent
+enable_skill() {
+    local agent=$1
+    local skill=$2
+
+    # Verify skill exists
+    if [ ! -d "$SKILL_HUB/$skill" ]; then
+        echo "Error: Skill '$skill' not found in hub"
+        echo "Available skills:"
+        get_all_skills | sed 's/^/  - /'
+        return 1
+    fi
+
+    local current=$(get_agent_skills "$agent")
+    if [ -z "$current" ]; then
+        echo "Error: Agent '$agent' not found"
+        return 1
+    fi
+
+    if [ "$current" = "all" ]; then
+        echo "$agent already has all skills"
+        return 0
+    fi
+
+    # Check if already enabled
+    if echo ",$current," | grep -q ",$skill,"; then
+        echo "$skill already enabled for $agent"
+        return 0
+    fi
+
+    # Add skill
+    local new_skills
+    if [ -z "$current" ]; then
+        new_skills="$skill"
+    else
+        new_skills="$current,$skill"
+    fi
+
+    set_agent_skills "$agent" "$new_skills"
+}
+
+# Disable a skill for an agent
+disable_skill() {
+    local agent=$1
+    local skill=$2
+
+    local current=$(get_agent_skills "$agent")
+    if [ -z "$current" ]; then
+        echo "Error: Agent '$agent' not found"
+        return 1
+    fi
+
+    if [ "$current" = "all" ]; then
+        # Convert "all" to explicit list minus the disabled skill
+        local all_skills=$(get_all_skills | tr '\n' ',' | sed 's/,$//')
+        current="$all_skills"
+    fi
+
+    # Remove skill from list
+    local new_skills=$(echo "$current" | tr ',' '\n' | grep -v "^${skill}$" | tr '\n' ',' | sed 's/,$//')
+
+    if [ "$new_skills" = "$current" ]; then
+        echo "$skill not found in $agent's skill list"
+        return 1
+    fi
+
+    if [ -z "$new_skills" ]; then
+        echo "Error: Cannot disable last skill. Use 'set' to change configuration."
+        return 1
+    fi
+
+    set_agent_skills "$agent" "$new_skills"
+}
+
+# Copy skills from one agent to another
+copy_agent() {
+    local from_agent=$1
+    local to_agent=$2
+
+    local skills=$(get_agent_skills "$from_agent")
+    if [ -z "$skills" ]; then
+        echo "Error: Source agent '$from_agent' not found"
+        return 1
+    fi
+
+    local to_path=$(get_agent_path "$to_agent")
+    if [ -z "$to_path" ]; then
+        echo "Error: Target agent '$to_agent' not found"
+        return 1
+    fi
+
+    echo "Copying skills from $from_agent to $to_agent..."
+    set_agent_skills "$to_agent" "$skills"
+}
+
+# Reset agent to all skills
+reset_agent() {
+    local agent=$1
+
+    local path=$(get_agent_path "$agent")
+    if [ -z "$path" ]; then
+        echo "Error: Agent '$agent' not found"
+        return 1
+    fi
+
+    echo "Resetting $agent to all skills..."
+    set_agent_skills "$agent" "all"
+}
+
+#================================================================================
+# Interactive Matrix (full TUI)
+#================================================================================
+
+interactive_matrix() {
+    # Check for terminal
+    if [ ! -t 0 ]; then
+        echo "Error: Interactive matrix requires a terminal"
+        return 1
+    fi
+
+    # Load data
+    local skills=()
+    while IFS= read -r skill; do
+        skills+=("$skill")
+    done < <(get_all_skills)
+    local num_skills=${#skills[@]}
+
+    local agents=()
+    local agent_paths=()
+    while IFS= read -r line || [ -n "$line" ]; do
+        parsed=$(parse_config_line "$line") || continue
+        IFS=: read -r name path _ <<< "$parsed"
+        agents+=("$name")
+        agent_paths+=("$path")
+    done < "$CONFIG_FILE"
+    local num_agents=${#agents[@]}
+
+    # Build state matrix (skill_index,agent_index -> 0/1)
+    # Using a flat array: index = skill_idx * num_agents + agent_idx
+    local state=()
+    for ((s=0; s<num_skills; s++)); do
+        local skill="${skills[$s]}"
+        for ((a=0; a<num_agents; a++)); do
+            local agent="${agents[$a]}"
+            local agent_skills=$(get_agent_skills "$agent")
+            local enabled=0
+            if [ "$agent_skills" = "all" ]; then
+                enabled=1
+            elif [[ ",$agent_skills," == *",$skill,"* ]]; then
+                enabled=1
+            fi
+            state+=($enabled)
+        done
+    done
+
+    # Cursor position
+    local cur_skill=0
+    local cur_agent=0
+
+    # Column widths
+    local skill_col=22
+    local agent_col=12
+
+    # Save original state for comparison
+    local original_state=("${state[@]}")
+
+    # Helper to get/set state
+    get_state() { echo "${state[$(($1 * num_agents + $2))]}"; }
+    set_state() { state[$(($1 * num_agents + $2))]=$3; }
+    toggle_state() {
+        local idx=$(($1 * num_agents + $2))
+        if [ "${state[$idx]}" = "1" ]; then
+            state[$idx]=0
+        else
+            state[$idx]=1
+        fi
+    }
+
+    # Draw the matrix
+    draw_matrix() {
+        # Move cursor to top-left instead of clearing (prevents flicker)
+        printf "\033[H"
+        printf "\033[1m Skill Hub - Interactive Matrix\033[0m\033[K\n"
+        printf " ←→↑↓ navigate | Space toggle | Enter save | q quit\033[K\n\n"
+
+        # Header row
+        printf " %-${skill_col}s" ""
+        for ((a=0; a<num_agents; a++)); do
+            local agent="${agents[$a]}"
+            if [ $a -eq $cur_agent ]; then
+                printf "\033[1;4m%-${agent_col}s\033[0m" "$agent"
+            else
+                printf "%-${agent_col}s" "$agent"
+            fi
+        done
+        printf "\033[K\n"
+
+        # Separator
+        printf " "
+        for ((i=0; i<skill_col; i++)); do printf "─"; done
+        for ((a=0; a<num_agents; a++)); do
+            for ((i=0; i<agent_col; i++)); do printf "─"; done
+        done
+        printf "\033[K\n"
+
+        # Skill rows
+        for ((s=0; s<num_skills; s++)); do
+            local skill="${skills[$s]}"
+            local display_skill="$skill"
+            [ ${#skill} -gt $((skill_col-2)) ] && display_skill="${skill:0:$((skill_col-4))}.."
+
+            # Highlight current row
+            if [ $s -eq $cur_skill ]; then
+                printf "\033[1m %-${skill_col}s\033[0m" "$display_skill"
+            else
+                printf " %-${skill_col}s" "$display_skill"
+            fi
+
+            for ((a=0; a<num_agents; a++)); do
+                local val=$(get_state $s $a)
+                local cell=""
+                if [ "$val" = "1" ]; then
+                    cell="[✓]"
+                else
+                    cell="[ ]"
+                fi
+
+                # Highlight current cell
+                if [ $s -eq $cur_skill ] && [ $a -eq $cur_agent ]; then
+                    printf "\033[7m%-${agent_col}s\033[0m" "$cell"
+                elif [ "$val" = "1" ]; then
+                    printf "\033[32m%-${agent_col}s\033[0m" "$cell"
+                else
+                    printf "\033[90m%-${agent_col}s\033[0m" "$cell"
+                fi
+            done
+            printf "\033[K\n"
+        done
+
+        printf "\033[K\n"
+    }
+
+    # Read a single key
+    read_key() {
+        local key
+        IFS= read -rsn1 key
+        if [[ $key == $'\x1b' ]]; then
+            read -rsn2 -t 0.1 key
+            echo "$key"
+        elif [[ $key == "" ]]; then
+            echo "enter"
+        else
+            echo "$key"
+        fi
+    }
+
+    # Main loop
+    stty -echo
+    trap 'stty echo; printf "\033[?25h"' EXIT
+    printf "\033[?25l"  # Hide cursor
+    clear  # Initial clear only once
+
+    while true; do
+        draw_matrix
+        local key=$(read_key)
+
+        case "$key" in
+            "[A") # Up
+                [ $cur_skill -gt 0 ] && ((cur_skill--))
+                ;;
+            "[B") # Down
+                [ $cur_skill -lt $((num_skills-1)) ] && ((cur_skill++))
+                ;;
+            "[C") # Right
+                [ $cur_agent -lt $((num_agents-1)) ] && ((cur_agent++))
+                ;;
+            "[D") # Left
+                [ $cur_agent -gt 0 ] && ((cur_agent--))
+                ;;
+            " ") # Space - toggle
+                toggle_state $cur_skill $cur_agent
+                ;;
+            "enter")
+                # Apply changes
+                stty echo
+                printf "\033[?25h"
+                clear
+                echo "Applying changes..."
+                echo ""
+
+                for ((a=0; a<num_agents; a++)); do
+                    local agent="${agents[$a]}"
+                    local new_skills=""
+                    for ((s=0; s<num_skills; s++)); do
+                        if [ "$(get_state $s $a)" = "1" ]; then
+                            [ -n "$new_skills" ] && new_skills="$new_skills,"
+                            new_skills="$new_skills${skills[$s]}"
+                        fi
+                    done
+                    if [ -z "$new_skills" ]; then
+                        echo "Warning: $agent would have no skills, skipping"
+                    else
+                        # Check if all skills selected
+                        local all_selected=true
+                        for ((s=0; s<num_skills; s++)); do
+                            if [ "$(get_state $s $a)" = "0" ]; then
+                                all_selected=false
+                                break
+                            fi
+                        done
+                        if [ "$all_selected" = true ]; then
+                            new_skills="all"
+                        fi
+                        set_agent_skills "$agent" "$new_skills"
+                    fi
+                done
+                echo ""
+                echo "Done! Press any key to continue..."
+                read -rsn1
+                return 0
+                ;;
+            "q"|"Q")
+                stty echo
+                printf "\033[?25h"
+                clear
+                echo "Cancelled - no changes made."
+                return 0
+                ;;
+        esac
+    done
+}
+
+#================================================================================
+# Interactive TUI (requires gum)
+#================================================================================
+
+interactive() {
+    if ! command -v gum &>/dev/null; then
+        echo "Error: Interactive mode requires 'gum'"
+        echo "Install with: brew install gum"
+        return 1
+    fi
+
+    while true; do
+        # Build agent list
+        local agents=()
+        while IFS= read -r line || [ -n "$line" ]; do
+            parsed=$(parse_config_line "$line") || continue
+            IFS=: read -r name _ _ <<< "$parsed"
+            agents+=("$name")
+        done < "$CONFIG_FILE"
+
+        # Main menu
+        local action=$(gum choose --header "Skill Hub - What would you like to do?" \
+            "Matrix" \
+            "Configure agent" \
+            "Apply preset" \
+            "Create preset" \
+            "Exit")
+
+        case "$action" in
+            "Matrix")
+                interactive_matrix
+                ;;
+            "Configure agent")
+                local agent=$(gum choose --header "Select agent to configure:" "${agents[@]}")
+                [ -z "$agent" ] && continue
+
+                local current=$(get_agent_skills "$agent")
+                local all_skills=$(get_all_skills)
+
+                # Build list of currently enabled skills for --selected
+                local enabled_skills=""
+                if [ "$current" = "all" ]; then
+                    enabled_skills="$all_skills"
+                else
+                    enabled_skills=$(echo "$current" | tr ',' '\n')
+                fi
+
+                # Convert to comma-separated for gum --selected
+                local selected_arg=$(echo "$enabled_skills" | tr '\n' ',' | sed 's/,$//')
+
+                echo ""
+                echo "Select skills for $agent (space to toggle, enter to confirm):"
+                echo ""
+
+                # Multi-select with current state pre-selected
+                local new_selection=$(echo "$all_skills" | gum choose --no-limit --selected="$selected_arg" --header "Skills for $agent (✓ = enabled):")
+
+                if [ -n "$new_selection" ]; then
+                    local new_skills=$(echo "$new_selection" | tr '\n' ',' | sed 's/,$//')
+                    set_agent_skills "$agent" "$new_skills"
+                else
+                    # Empty selection - ask if they want all or none
+                    local choice=$(gum choose --header "No skills selected. What would you like to do?" \
+                        "Set to all skills" \
+                        "Keep current configuration" \
+                        "Cancel")
+                    case "$choice" in
+                        "Set to all skills")
+                            reset_agent "$agent"
+                            ;;
+                        *)
+                            echo "Configuration unchanged."
+                            ;;
+                    esac
+                fi
+                ;;
+            "Apply preset")
+                if [ ! -f "$PRESETS_FILE" ]; then
+                    echo "No presets available. Create one first."
+                    gum confirm "Press enter to continue" --affirmative="OK" --negative=""
+                    continue
+                fi
+                local preset=$(cut -d: -f1 "$PRESETS_FILE" | gum choose --header "Select preset:")
+                [ -z "$preset" ] && continue
+                local agent=$(gum choose --header "Apply '$preset' to which agent?" "${agents[@]}")
+                [ -n "$agent" ] && preset_apply "$agent" "$preset"
+                ;;
+            "Create preset")
+                local name=$(gum input --placeholder "Preset name (e.g., research, dev)")
+                [ -z "$name" ] && continue
+                local all_skills=$(get_all_skills)
+                local selected=$(echo "$all_skills" | gum filter --header "Select skills for preset '$name':" --no-limit)
+                if [ -n "$selected" ]; then
+                    local skills_csv=$(echo "$selected" | tr '\n' ',' | sed 's/,$//')
+                    preset_create "$name" "$skills_csv"
+                fi
+                ;;
+            "Exit"|"")
+                break
+                ;;
+        esac
+    done
+}
+
+# Main
+case "${1:-}" in
+    init)
+        init_skill_hub
+        ;;
+    new)
+        new_skill "$2"
+        ;;
+    path)
+        print_path
+        ;;
+    status)
+        status
+        ;;
+    matrix)
+        interactive_matrix
+        ;;
+    i|interactive)
+        interactive
+        ;;
+    list)
+        list_skills
+        ;;
+    sync)
+        sync_all "${2:-}"
+        ;;
+    deps)
+        if [ "${2:-}" = "install" ]; then
+            check_deps true
+        else
+            check_deps false
+        fi
+        ;;
+    add-agent)
+        if [ -z "${2:-}" ] || [ -z "${3:-}" ]; then
+            echo "Usage: skill-hub add-agent <name> <path> [skills]"
+            echo "  skills: 'all' (default) or comma-separated list"
+            exit 1
+        fi
+        add_agent "$2" "$3" "${4:-all}"
+        ;;
+    link-project)
+        if [ -z "${2:-}" ] || [ -z "${3:-}" ]; then
+            echo "Usage: skill-hub link-project <skill> <project-path>"
+            exit 1
+        fi
+        link_project "$2" "$3"
+        ;;
+    set)
+        if [ -z "${2:-}" ] || [ -z "${3:-}" ]; then
+            echo "Usage: skill-hub set <agent> <skills>"
+            echo "  skills: 'all' or comma-separated list (e.g., 'bird,ynab,spreadsheet')"
+            exit 1
+        fi
+        set_agent_skills "$2" "$3"
+        ;;
+    enable)
+        if [ -z "${2:-}" ] || [ -z "${3:-}" ]; then
+            echo "Usage: skill-hub enable <agent> <skill>"
+            exit 1
+        fi
+        enable_skill "$2" "$3"
+        ;;
+    disable)
+        if [ -z "${2:-}" ] || [ -z "${3:-}" ]; then
+            echo "Usage: skill-hub disable <agent> <skill>"
+            exit 1
+        fi
+        disable_skill "$2" "$3"
+        ;;
+    copy)
+        if [ -z "${2:-}" ] || [ -z "${3:-}" ]; then
+            echo "Usage: skill-hub copy <from-agent> <to-agent>"
+            exit 1
+        fi
+        copy_agent "$2" "$3"
+        ;;
+    reset)
+        if [ -z "${2:-}" ]; then
+            echo "Usage: skill-hub reset <agent>"
+            exit 1
+        fi
+        reset_agent "$2"
+        ;;
+    preset)
+        case "${2:-}" in
+            create)
+                if [ -z "${3:-}" ] || [ -z "${4:-}" ]; then
+                    echo "Usage: skill-hub preset create <name> <skills>"
+                    echo "  skills: comma-separated list (e.g., 'perplexity,deep-research')"
+                    exit 1
+                fi
+                preset_create "$3" "$4"
+                ;;
+            list)
+                preset_list
+                ;;
+            show)
+                if [ -z "${3:-}" ]; then
+                    echo "Usage: skill-hub preset show <name>"
+                    exit 1
+                fi
+                preset_show "$3"
+                ;;
+            apply)
+                if [ -z "${3:-}" ] || [ -z "${4:-}" ]; then
+                    echo "Usage: skill-hub preset apply <agent> <preset>"
+                    exit 1
+                fi
+                preset_apply "$3" "$4"
+                ;;
+            delete)
+                if [ -z "${3:-}" ]; then
+                    echo "Usage: skill-hub preset delete <name>"
+                    exit 1
+                fi
+                preset_delete "$3"
+                ;;
+            *)
+                echo "Usage: skill-hub preset <create|list|show|apply|delete> [args]"
+                exit 1
+                ;;
+        esac
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        usage
+        exit 1
+        ;;
+esac
