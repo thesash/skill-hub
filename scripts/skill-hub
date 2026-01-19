@@ -91,13 +91,62 @@ AGENTS
 
     echo "Created $SKILL_HUB_DATA"
     echo ""
+
+    # Ask about git/GitHub setup
+    local setup_git=false
+    local setup_github=false
+
+    if command -v gum &>/dev/null; then
+        if gum confirm "Initialize git repo for version control?"; then
+            setup_git=true
+            if command -v gh &>/dev/null && gum confirm "Push to GitHub as a private repo?"; then
+                setup_github=true
+            fi
+        fi
+    else
+        echo -n "Initialize git repo for version control? [y/N] "
+        read -r answer
+        if [[ "$answer" =~ ^[Yy] ]]; then
+            setup_git=true
+            if command -v gh &>/dev/null; then
+                echo -n "Push to GitHub as a private repo? [y/N] "
+                read -r answer
+                [[ "$answer" =~ ^[Yy] ]] && setup_github=true
+            fi
+        fi
+    fi
+
+    if [ "$setup_git" = true ]; then
+        cd "$SKILL_HUB_DATA"
+        git init -q
+        git add -A
+        git commit -q -m "Initial commit: skill-hub setup"
+        echo "Initialized git repo"
+
+        if [ "$setup_github" = true ]; then
+            local repo_name="agent-skills"
+            if command -v gum &>/dev/null; then
+                repo_name=$(gum input --placeholder "agent-skills" --value "agent-skills" --header "Repo name:")
+            else
+                echo -n "Repo name [agent-skills]: "
+                read -r input
+                [ -n "$input" ] && repo_name="$input"
+            fi
+
+            if gh repo create "$repo_name" --private --source=. --push 2>/dev/null; then
+                echo "Pushed to GitHub: https://github.com/$(gh api user -q .login)/$repo_name (private)"
+            else
+                echo "Failed to create GitHub repo. You can do it later with:"
+                echo "  cd $SKILL_HUB_DATA && gh repo create $repo_name --private --source=. --push"
+            fi
+        fi
+    fi
+
+    echo ""
     echo "Next steps:"
     echo "  1. Create a skill:  skill-hub new my-first-skill"
     echo "  2. Edit agents.conf to configure your agents"
     echo "  3. Sync skills:     skill-hub sync"
-    echo ""
-    echo "Optional: Version control your skills"
-    echo "  cd $SKILL_HUB_DATA && git init"
 }
 
 new_skill() {
