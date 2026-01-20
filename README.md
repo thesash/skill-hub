@@ -74,6 +74,7 @@ skill-hub disable <agent> <skill>   # Remove a skill from an agent
 skill-hub copy <from> <to>          # Copy skills from one agent to another
 skill-hub reset <agent>             # Reset agent to all skills
 skill-hub sync [agent]              # Apply config to filesystem (create/update symlinks)
+skill-hub uninstall [agent]         # Detach agents from hub (copy skills locally)
 ```
 
 ### Presets
@@ -111,6 +112,7 @@ clawdbot:~/.clawdbot/skills:all
 
 - `all` = symlink entire directory (agent gets everything)
 - `skill1,skill2` = individual symlinks (agent only gets listed skills)
+- `skills/.system` holds Codex system skills; it is included when `skills: all` is used (directory symlink) but is hidden from explicit skill lists
 
 ## Creating Skills
 
@@ -180,6 +182,7 @@ metadata: {"clawdbot":{"requires":{"bins":["yt-dlp","ffmpeg"],"env":["API_KEY"]}
 ```
 ~/.skill-hub/                        # User data directory
 ├── skills/                          # Your skills
+│   ├── .system/                     # Codex system skills
 │   ├── my-skill/                    # Central skill (directory)
 │   │   └── SKILL.md
 │   └── ynab-review -> ~/p/ynab-review  # Project-linked skill (symlink)
@@ -194,6 +197,19 @@ metadata: {"clawdbot":{"requires":{"bins":["yt-dlp","ffmpeg"],"env":["API_KEY"]}
 ~/.claude/skills/my-skill -> ~/.skill-hub/skills/my-skill   # Agent symlinks
 ~/.codex/skills/my-skill -> ~/.skill-hub/skills/my-skill
 ```
+
+## Detaching (Uninstall)
+
+To return to per-agent, local skill folders:
+
+```bash
+skill-hub uninstall          # All agents
+skill-hub uninstall codex    # Single agent
+```
+
+This replaces directory or per-skill symlinks with local copies in each agent's skills directory. Project-linked skills remain symlinks to their repos.
+Running `skill-hub sync` later will re-apply whatever `agents.conf` specifies.
+Note: `uninstall` has not been tested yet.
 
 ## Version Control Your Skills
 

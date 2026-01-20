@@ -33,6 +33,7 @@ Commands:
     list                List all skills
     info <skill>        Show detailed info about a skill
     sync [agent]        Apply config to filesystem (create/update symlinks)
+    uninstall [agent]   Detach agents from the hub (copy skills locally; untested)
     path                Print data directory path
 
     set <agent> <skills>
@@ -464,6 +465,123 @@ sync_all() {
 
         if [ -z "$filter" ] || [ "$filter" = "$name" ]; then
             sync_agent "$name" "$path" "$skills"
+        fi
+    done < "$CONFIG_FILE"
+}
+
+trash_path() {
+    local path=$1
+
+    if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+        return 0
+    fi
+
+    local trash_dir="$HOME/.Trash"
+    if [ ! -d "$trash_dir" ]; then
+        echo "Error: Trash directory not found; cannot remove $path safely."
+        return 1
+    fi
+
+    local base=$(basename "$path")
+    local stamp=$(date +"%Y%m%d-%H%M%S")
+    local dest="$trash_dir/${base}.${stamp}.$$"
+    mv "$path" "$dest"
+}
+
+install_skill_for_agent() {
+    local src=$1
+    local dst=$2
+    local label=$3
+
+    if [ -L "$src" ]; then
+        local target=$(readlink "$src")
+
+        if [ -L "$dst" ]; then
+            local current=$(readlink "$dst")
+            if [ "$current" = "$target" ]; then
+                echo "  $label: ok (linked)"
+                return 0
+            fi
+            trash_path "$dst" || return 1
+        elif [ -e "$dst" ]; then
+            echo "  WARN: $label exists and is not a symlink, skipping"
+            return 0
+        fi
+
+        ln -s "$target" "$dst"
+        echo "  $label: linked -> $target"
+        return 0
+    fi
+
+    if [ -L "$dst" ]; then
+        trash_path "$dst" || return 1
+    elif [ -e "$dst" ]; then
+        echo "  WARN: $label exists and is not a symlink, skipping"
+        return 0
+    fi
+
+    cp -R "$src" "$dst"
+    echo "  $label: copied"
+}
+
+uninstall_agent() {
+    local name=$1
+    local path=$2
+    local skills=$3
+
+    echo "Uninstalling $name..."
+
+    if [ -L "$path" ]; then
+        echo "  Detaching directory symlink..."
+        trash_path "$path" || return 1
+        mkdir -p "$path"
+    else
+        mkdir -p "$path"
+    fi
+
+    local include_system=false
+    local skill_list=()
+
+    if [ -z "$skills" ] || [ "$skills" = "all" ]; then
+        include_system=true
+        while IFS= read -r skill; do
+            [ -n "$skill" ] && skill_list+=("$skill")
+        done < <(get_all_skills)
+    else
+        IFS=',' read -ra skill_list <<< "$skills"
+    fi
+
+    for skill in "${skill_list[@]}"; do
+        skill=$(echo "$skill" | tr -d ' ')
+        [ -z "$skill" ] && continue
+
+        local src="$SKILL_HUB/$skill"
+        local dst="$path/$skill"
+
+        if [ ! -e "$src" ] && [ ! -L "$src" ]; then
+            echo "  WARN: $skill not found in hub"
+            continue
+        fi
+
+        install_skill_for_agent "$src" "$dst" "$skill" || return 1
+    done
+
+    if [ "$include_system" = true ] && [ -d "$SKILL_HUB/.system" ]; then
+        install_skill_for_agent "$SKILL_HUB/.system" "$path/.system" ".system" || return 1
+    fi
+}
+
+uninstall_all() {
+    local filter=$1
+
+    [ ! -f "$CONFIG_FILE" ] && echo "No config file at $CONFIG_FILE" && return 1
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        parsed=$(parse_config_line "$line") || continue
+        IFS=: read -r name path skills <<< "$parsed"
+
+        if [ -z "$filter" ] || [ "$filter" = "$name" ]; then
+            uninstall_agent "$name" "$path" "$skills"
         fi
     done < "$CONFIG_FILE"
 }
@@ -1344,6 +1462,9 @@ case "${1:-}" in
         ;;
     sync)
         sync_all "${2:-}"
+        ;;
+    uninstall)
+        uninstall_all "${2:-}"
         ;;
     deps)
         if [ "${2:-}" = "install" ]; then
