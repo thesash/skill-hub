@@ -36,10 +36,14 @@ skill-hub sync                # Sync skills to agents
 ## Quick Start
 
 ```bash
-skill-hub matrix              # Interactive matrix (arrows, space to toggle, enter to save)
-skill-hub i                   # Interactive menu (requires gum)
+skill-hub                     # Launch interactive menu (requires gum)
 skill-hub status              # Detailed status
 ```
+
+The interactive menu lets you:
+- Configure which skills each agent gets
+- Manage skills (view info, migrate to project repos)
+- Create and apply skill presets
 
 ## Commands
 
@@ -54,10 +58,11 @@ skill-hub path                # Print data directory path
 ### View & Edit
 
 ```bash
-skill-hub matrix              # Interactive matrix - arrows to navigate, space to toggle, enter to save
-skill-hub i                   # Interactive menu (requires gum)
+skill-hub                     # Interactive menu (requires gum) - default when no command
+skill-hub i                   # Same as above
 skill-hub status              # Show skills and agent distribution
-skill-hub list                # List all skills
+skill-hub list                # List all skills (shows central vs project-linked)
+skill-hub info <skill>        # Show detailed info about a skill
 ```
 
 ### Skill Distribution
@@ -86,7 +91,9 @@ skill-hub preset delete <name>            # Delete a preset
 ```bash
 skill-hub add-agent <name> <path> [skills]     # Add agent target
 skill-hub link-project <skill> <project-path>  # Link skill to project repo
+skill-hub migrate <skill> [path]               # Move skill to its own project repo
 skill-hub deps [install]                       # Check/install dependencies
+skill-hub config [key] [value]                 # Get/set configuration
 ```
 
 ## Configuration
@@ -129,10 +136,35 @@ Instructions for the AI agent...
 
 ### Project-Linked Skills
 
-Keep skills versioned with their project repos:
+Skills can live in two places:
+- **Central** (`~/.skill-hub/skills/`) - Simple, all skills together
+- **Project-linked** (your own repo) - Skill versions with its project
+
+#### Migrating a Skill to Its Own Repo
+
+When a skill grows complex enough to warrant its own repo:
 
 ```bash
-skill-hub link-project ynab-review ~/p/ynab-review/skill
+# Configure your project directory (during init, or manually)
+skill-hub config project_dir ~/p
+skill-hub config git_init true
+
+# Migrate a skill to its own repo
+skill-hub migrate my-skill
+# Creates: ~/p/my-skill/SKILL.md
+# Symlink: ~/.skill-hub/skills/my-skill -> ~/p/my-skill
+
+# Then push to GitHub if desired
+cd ~/p/my-skill
+gh repo create my-skill --private --source=. --push
+```
+
+#### Linking an Existing Repo
+
+If you already have a skill in a project repo:
+
+```bash
+skill-hub link-project ynab-review ~/p/ynab-review
 ```
 
 ### Skill Dependencies
@@ -148,11 +180,16 @@ metadata: {"clawdbot":{"requires":{"bins":["yt-dlp","ffmpeg"],"env":["API_KEY"]}
 ```
 ~/.skill-hub/                        # User data directory
 ├── skills/                          # Your skills
-│   ├── my-skill/
+│   ├── my-skill/                    # Central skill (directory)
 │   │   └── SKILL.md
-│   └── another-skill/
+│   └── ynab-review -> ~/p/ynab-review  # Project-linked skill (symlink)
 ├── agents.conf                      # Agent configuration
-└── presets.conf                     # Saved presets
+├── presets.conf                     # Saved presets
+└── settings.conf                    # User settings (project_dir, git_init)
+
+~/p/ynab-review/                     # Project repo for a skill
+├── SKILL.md                         # Skill definition at repo root
+└── ...                              # Other project files
 
 ~/.claude/skills/my-skill -> ~/.skill-hub/skills/my-skill   # Agent symlinks
 ~/.codex/skills/my-skill -> ~/.skill-hub/skills/my-skill

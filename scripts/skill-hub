@@ -11,6 +11,7 @@ SKILL_HUB_DATA="${SKILL_HUB_DATA:-$HOME/.skill-hub}"
 SKILLS_DIR="$SKILL_HUB_DATA/skills"
 AGENTS_FILE="$SKILL_HUB_DATA/agents.conf"
 PRESETS_FILE="$SKILL_HUB_DATA/presets.conf"
+CONFIG_SETTINGS="$SKILL_HUB_DATA/settings.conf"
 
 # For backwards compatibility during migration
 SKILL_HUB="$SKILLS_DIR"
@@ -20,7 +21,9 @@ usage() {
     cat <<EOF
 skill-hub - Centralized skill management
 
-Usage: skill-hub <command> [options]
+Usage: skill-hub [command] [options]
+
+Running 'skill-hub' with no command launches the interactive menu (requires gum).
 
 Commands:
     init                Initialize ~/.skill-hub/ data directory
@@ -28,6 +31,7 @@ Commands:
     status              Show current skill distribution status
     i, interactive      Interactive menu (requires gum)
     list                List all skills
+    info <skill>        Show detailed info about a skill
     sync [agent]        Apply config to filesystem (create/update symlinks)
     path                Print data directory path
 
@@ -44,6 +48,8 @@ Commands:
                         Add agent target (skills: "all" or comma-separated)
     link-project <skill> <project-path>
                         Link a skill to a project repo
+    migrate <skill> [path]
+                        Move skill to project repo (default: \$PROJECT_DIR/<skill>)
 
     preset create <name> <skills>
                         Create a preset skill bundle
@@ -55,6 +61,8 @@ Commands:
                         Delete a preset
 
     deps [install]      Check/install skill dependencies
+    config [key] [value]
+                        Get/set configuration (project_dir, git_init)
 
 Data directory: $SKILL_HUB_DATA
 EOF
@@ -63,6 +71,67 @@ EOF
 #================================================================================
 # Init & Setup
 #================================================================================
+
+# Get a setting value
+get_setting() {
+    local key=$1
+    local default=$2
+    if [ -f "$CONFIG_SETTINGS" ]; then
+        local value=$(grep "^$key=" "$CONFIG_SETTINGS" 2>/dev/null | cut -d= -f2-)
+        [ -n "$value" ] && echo "$value" && return 0
+    fi
+    echo "$default"
+}
+
+# Set a setting value
+set_setting() {
+    local key=$1
+    local value=$2
+    mkdir -p "$(dirname "$CONFIG_SETTINGS")"
+    touch "$CONFIG_SETTINGS"
+
+    if grep -q "^$key=" "$CONFIG_SETTINGS" 2>/dev/null; then
+        local tmp=$(mktemp)
+        sed "s|^$key=.*|$key=$value|" "$CONFIG_SETTINGS" > "$tmp"
+        mv "$tmp" "$CONFIG_SETTINGS"
+    else
+        echo "$key=$value" >> "$CONFIG_SETTINGS"
+    fi
+}
+
+# Show or modify config
+config_cmd() {
+    local key=$1
+    local value=$2
+
+    if [ -z "$key" ]; then
+        echo "Current configuration:"
+        echo ""
+        if [ -f "$CONFIG_SETTINGS" ]; then
+            cat "$CONFIG_SETTINGS"
+        else
+            echo "(no settings configured)"
+        fi
+        echo ""
+        echo "Available settings:"
+        echo "  project_dir   Default directory for project repos (e.g., ~/p)"
+        echo "  git_init      Auto-initialize git in migrated repos (true/false)"
+        return 0
+    fi
+
+    if [ -z "$value" ]; then
+        local current=$(get_setting "$key" "")
+        if [ -n "$current" ]; then
+            echo "$key=$current"
+        else
+            echo "$key is not set"
+        fi
+        return 0
+    fi
+
+    set_setting "$key" "$value"
+    echo "Set $key=$value"
+}
 
 init_skill_hub() {
     if [ -d "$SKILL_HUB_DATA" ]; then
@@ -142,11 +211,42 @@ AGENTS
         fi
     fi
 
+    # Ask about project directory for skill migration
+    echo ""
+    local project_dir=""
+    if command -v gum &>/dev/null; then
+        if gum confirm "Configure a default project directory for skill migration?"; then
+            project_dir=$(gum input --placeholder "~/p" --value "$HOME/p" --header "Project directory (where skill repos will be created):")
+        fi
+    else
+        echo -n "Configure a default project directory for skill migration? [y/N] "
+        read -r answer
+        if [[ "$answer" =~ ^[Yy] ]]; then
+            echo -n "Project directory [~/p]: "
+            read -r input
+            project_dir="${input:-$HOME/p}"
+        fi
+    fi
+
+    if [ -n "$project_dir" ]; then
+        # Expand ~ if present
+        project_dir="${project_dir/#\~/$HOME}"
+        set_setting "project_dir" "$project_dir"
+        set_setting "git_init" "true"
+        echo "Set project_dir=$project_dir"
+        echo "Set git_init=true"
+    fi
+
     echo ""
     echo "Next steps:"
     echo "  1. Create a skill:  skill-hub new my-first-skill"
     echo "  2. Edit agents.conf to configure your agents"
     echo "  3. Sync skills:     skill-hub sync"
+    if [ -n "$project_dir" ]; then
+        echo ""
+        echo "To move a skill to its own repo:"
+        echo "  skill-hub migrate <skill-name>"
+    fi
 }
 
 new_skill() {
@@ -216,6 +316,10 @@ get_all_skills() {
 list_skills() {
     echo "Skills in hub ($SKILL_HUB):"
     echo ""
+
+    local central_count=0
+    local linked_count=0
+
     for skill_dir in "$SKILL_HUB"/*/; do
         [ -d "$skill_dir" ] || continue
         skill=$(basename "$skill_dir")
@@ -223,11 +327,16 @@ list_skills() {
 
         if [ -L "${skill_dir%/}" ]; then
             target=$(readlink "${skill_dir%/}")
-            echo "  $skill -> $target"
+            printf "  %-25s -> %s\n" "$skill" "$target"
+            ((linked_count++))
         else
-            echo "  $skill"
+            printf "  %-25s [central]\n" "$skill"
+            ((central_count++))
         fi
     done
+
+    echo ""
+    echo "Total: $((central_count + linked_count)) skills ($central_count central, $linked_count project-linked)"
 }
 
 parse_config_line() {
@@ -397,6 +506,174 @@ link_project() {
 
     ln -s "$project_path" "$skill_path"
     echo "Linked $skill -> $project_path"
+}
+
+# Show detailed info about a skill
+skill_info() {
+    local skill=$1
+    local skill_path="$SKILL_HUB/$skill"
+
+    if [ ! -e "$skill_path" ]; then
+        echo "Error: Skill '$skill' not found"
+        return 1
+    fi
+
+    echo "=== $skill ==="
+    echo ""
+
+    # Location info
+    if [ -L "$skill_path" ]; then
+        local target=$(readlink "$skill_path")
+        echo "Type:     project-linked"
+        echo "Symlink:  $skill_path"
+        echo "Target:   $target"
+
+        # Check if target exists
+        if [ ! -e "$target" ]; then
+            echo "Status:   BROKEN (target does not exist)"
+        else
+            echo "Status:   ok"
+        fi
+    else
+        echo "Type:     central"
+        echo "Location: $skill_path"
+    fi
+
+    # SKILL.md info
+    local skill_md="$skill_path/SKILL.md"
+    if [ -f "$skill_md" ]; then
+        echo ""
+        echo "=== SKILL.md ==="
+        # Extract frontmatter
+        local in_frontmatter=false
+        while IFS= read -r line; do
+            if [ "$line" = "---" ]; then
+                if [ "$in_frontmatter" = true ]; then
+                    break
+                else
+                    in_frontmatter=true
+                    continue
+                fi
+            fi
+            if [ "$in_frontmatter" = true ]; then
+                echo "  $line"
+            fi
+        done < "$skill_md"
+    fi
+
+    # Show which agents have this skill
+    echo ""
+    echo "=== Agents ==="
+    if [ -f "$CONFIG_FILE" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            parsed=$(parse_config_line "$line") || continue
+            IFS=: read -r name path skills <<< "$parsed"
+
+            local has_skill=false
+            if [ "$skills" = "all" ]; then
+                has_skill=true
+            else
+                if echo ",$skills," | grep -q ",$skill,"; then
+                    has_skill=true
+                fi
+            fi
+
+            if [ "$has_skill" = true ]; then
+                echo "  $name: enabled"
+            else
+                echo "  $name: -"
+            fi
+        done < "$CONFIG_FILE"
+    fi
+}
+
+# Migrate a skill to its own project repo
+migrate_skill() {
+    local skill=$1
+    local target_path=$2
+
+    local skill_path="$SKILL_HUB/$skill"
+
+    # Verify skill exists
+    if [ ! -e "$skill_path" ]; then
+        echo "Error: Skill '$skill' not found in hub"
+        return 1
+    fi
+
+    # Check if already project-linked
+    if [ -L "$skill_path" ]; then
+        local current_target=$(readlink "$skill_path")
+        echo "Skill '$skill' is already project-linked:"
+        echo "  $skill_path -> $current_target"
+        return 1
+    fi
+
+    # Determine target path
+    if [ -z "$target_path" ]; then
+        local project_dir=$(get_setting "project_dir" "")
+        if [ -z "$project_dir" ]; then
+            echo "Error: No target path provided and project_dir not configured"
+            echo ""
+            echo "Either provide a path:"
+            echo "  skill-hub migrate $skill ~/p/$skill"
+            echo ""
+            echo "Or configure the default project directory:"
+            echo "  skill-hub config project_dir ~/p"
+            return 1
+        fi
+        target_path="$project_dir/$skill"
+    fi
+
+    # Expand ~ if present
+    target_path="${target_path/#\~/$HOME}"
+
+    # Check if target already exists
+    if [ -e "$target_path" ]; then
+        echo "Error: Target path already exists: $target_path"
+        echo ""
+        echo "If you want to link to an existing repo, use:"
+        echo "  skill-hub link-project $skill $target_path/skill"
+        return 1
+    fi
+
+    echo "Migrating '$skill' to project repo..."
+    echo "  From: $skill_path"
+    echo "  To:   $target_path"
+    echo ""
+
+    # Create target directory and move skill contents directly to it
+    mkdir -p "$target_path"
+    cp -r "$skill_path"/* "$target_path/"
+
+    # Initialize git if configured
+    local git_init=$(get_setting "git_init" "false")
+    if [ "$git_init" = "true" ]; then
+        echo "Initializing git repo..."
+        (
+            cd "$target_path"
+            git init -q
+            git add -A
+            git commit -q -m "Initial commit: $skill skill"
+        )
+        echo "  Created git repo with initial commit"
+    fi
+
+    # Remove original and create symlink to repo root
+    rm -rf "$skill_path"
+    ln -s "$target_path" "$skill_path"
+
+    echo ""
+    echo "Migration complete!"
+    echo "  Repo:    $target_path"
+    echo "  Symlink: $skill_path -> $target_path"
+    echo ""
+    echo "The skill is now a standalone repo. You can:"
+    echo "  cd $target_path"
+    if [ "$git_init" = "true" ]; then
+        echo "  gh repo create $skill --private --source=. --push"
+    else
+        echo "  git init && git add -A && git commit -m 'Initial commit'"
+    fi
 }
 
 #================================================================================
@@ -891,11 +1168,81 @@ interactive() {
         # Main menu
         local action=$(gum choose --header "Skill Hub - What would you like to do?" \
             "Configure agent" \
+            "Manage skills" \
             "Apply preset" \
             "Create preset" \
             "Exit")
 
         case "$action" in
+            "Manage skills")
+                # Build skill list with location info
+                local skill_items=()
+                for skill_dir in "$SKILL_HUB"/*/; do
+                    [ -d "$skill_dir" ] || continue
+                    local skill=$(basename "$skill_dir")
+                    [[ "$skill" == .* ]] && continue
+                    if [ -L "${skill_dir%/}" ]; then
+                        skill_items+=("$skill [linked]")
+                    else
+                        skill_items+=("$skill [central]")
+                    fi
+                done
+
+                local selected=$(printf '%s\n' "${skill_items[@]}" | gum choose --header "Select a skill:")
+                [ -z "$selected" ] && continue
+
+                # Extract skill name (remove [linked] or [central] suffix)
+                local skill_name=$(echo "$selected" | sed 's/ \[.*\]$//')
+                local skill_path="$SKILL_HUB/$skill_name"
+
+                # Show skill info and actions
+                echo ""
+                skill_info "$skill_name"
+                echo ""
+
+                local skill_action
+                if [ -L "$skill_path" ]; then
+                    skill_action=$(gum choose --header "What would you like to do with '$skill_name'?" \
+                        "Back to menu" \
+                        "View in Finder")
+                else
+                    skill_action=$(gum choose --header "What would you like to do with '$skill_name'?" \
+                        "Migrate to project repo" \
+                        "Back to menu" \
+                        "View in Finder")
+                fi
+
+                case "$skill_action" in
+                    "Migrate to project repo")
+                        local project_dir=$(get_setting "project_dir" "")
+                        local default_path=""
+                        if [ -n "$project_dir" ]; then
+                            default_path="$project_dir/$skill_name"
+                        fi
+
+                        local target_path=$(gum input \
+                            --placeholder "${default_path:-~/p/$skill_name}" \
+                            --value "$default_path" \
+                            --header "Target path for $skill_name repo:")
+
+                        if [ -n "$target_path" ]; then
+                            echo ""
+                            migrate_skill "$skill_name" "$target_path"
+                            echo ""
+                            gum confirm "Press enter to continue" --affirmative="OK" --negative=""
+                        fi
+                        ;;
+                    "View in Finder")
+                        if [ -L "$skill_path" ]; then
+                            open "$(readlink "$skill_path")"
+                        else
+                            open "$skill_path"
+                        fi
+                        ;;
+                    *)
+                        ;;
+                esac
+                ;;
             "Configure agent")
                 local agent=$(gum choose --header "Select agent to configure:" "${agents[@]}")
                 [ -z "$agent" ] && continue
@@ -988,6 +1335,13 @@ case "${1:-}" in
     list)
         list_skills
         ;;
+    info)
+        if [ -z "${2:-}" ]; then
+            echo "Usage: skill-hub info <skill>"
+            exit 1
+        fi
+        skill_info "$2"
+        ;;
     sync)
         sync_all "${2:-}"
         ;;
@@ -1012,6 +1366,19 @@ case "${1:-}" in
             exit 1
         fi
         link_project "$2" "$3"
+        ;;
+    migrate)
+        if [ -z "${2:-}" ]; then
+            echo "Usage: skill-hub migrate <skill> [target-path]"
+            echo ""
+            echo "Moves a skill from central storage to its own project repo."
+            echo "If target-path is omitted, uses \$project_dir/<skill> from config."
+            exit 1
+        fi
+        migrate_skill "$2" "${3:-}"
+        ;;
+    config)
+        config_cmd "${2:-}" "${3:-}"
         ;;
     set)
         if [ -z "${2:-}" ] || [ -z "${3:-}" ]; then
@@ -1092,7 +1459,13 @@ case "${1:-}" in
     -h|--help|help)
         usage
         ;;
+    "")
+        # No command - launch interactive mode
+        interactive
+        ;;
     *)
+        echo "Unknown command: $1"
+        echo ""
         usage
         exit 1
         ;;
