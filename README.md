@@ -91,10 +91,20 @@ skill-hub preset delete <name>            # Delete a preset
 
 ```bash
 skill-hub add-agent <name> <path> [skills]     # Add agent target
+skill-hub discover                             # Discover agents from clawdbot.json
 skill-hub link-project <skill> <project-path>  # Link skill to project repo
 skill-hub migrate <skill> [path]               # Move skill to its own project repo
 skill-hub deps [install]                       # Check/install dependencies
 skill-hub config [key] [value]                 # Get/set configuration
+```
+
+### Adopting Agent-Created Skills
+
+When agents create skills locally in their workspace, you can import them into skill-hub:
+
+```bash
+skill-hub local <agent>              # List local (non-symlinked) skills
+skill-hub adopt <agent> <skill>      # Import skill into skill-hub
 ```
 
 ## Configuration
@@ -135,6 +145,28 @@ allowed-tools: Bash, Read, Write, Edit
 
 Instructions for the AI agent...
 ```
+
+### Adopting Agent-Created Skills
+
+When an AI agent creates a skill in its local workspace (not through skill-hub), you can adopt it into the central hub:
+
+```bash
+# 1. See what local skills exist in an agent's workspace
+skill-hub local clawdbot-main
+#   meeting-researcher    [has SKILL.md]
+#   my-new-skill          [has SKILL.md]
+
+# 2. Adopt a skill into skill-hub
+skill-hub adopt clawdbot-main meeting-researcher
+# Copies to: ~/.skill-hub/skills/meeting-researcher/
+# Replaces local with symlink
+
+# 3. Enable for other agents
+skill-hub enable claude-code meeting-researcher
+skill-hub enable clawdbot meeting-researcher
+```
+
+The `sync` command will warn you if it detects local skills that aren't managed by skill-hub, giving you a chance to adopt them first.
 
 ### Project-Linked Skills
 

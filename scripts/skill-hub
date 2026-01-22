@@ -12,6 +12,7 @@ SKILLS_DIR="$SKILL_HUB_DATA/skills"
 AGENTS_FILE="$SKILL_HUB_DATA/agents.conf"
 PRESETS_FILE="$SKILL_HUB_DATA/presets.conf"
 CONFIG_SETTINGS="$SKILL_HUB_DATA/settings.conf"
+DISCOVERY_DONE=false
 
 # For backwards compatibility during migration
 SKILL_HUB="$SKILLS_DIR"
@@ -32,6 +33,7 @@ Commands:
     i, interactive      Interactive menu (requires gum)
     list                List all skills
     info <skill>        Show detailed info about a skill
+    discover            Discover agent workspaces (updates agents.conf)
     sync [agent]        Apply config to filesystem (create/update symlinks)
     uninstall [agent]   Detach agents from the hub (copy skills locally; untested)
     path                Print data directory path
@@ -44,6 +46,8 @@ Commands:
                         Remove a skill from an agent
     copy <from> <to>    Copy skills from one agent to another
     reset <agent>       Reset agent to all skills
+    move-skill <skill> <from-agent> <to-agent>
+                        Move a skill between agents
 
     add-agent <name> <path> [skills]
                         Add agent target (skills: "all" or comma-separated)
@@ -51,6 +55,10 @@ Commands:
                         Link a skill to a project repo
     migrate <skill> [path]
                         Move skill to project repo (default: \$PROJECT_DIR/<skill>)
+
+    local <agent>       List local (non-symlinked) skills in agent workspace
+    adopt <agent> <skill>
+                        Import a skill from agent workspace into skill-hub
 
     preset create <name> <skills>
                         Create a preset skill bundle
@@ -132,6 +140,149 @@ config_cmd() {
 
     set_setting "$key" "$value"
     echo "Set $key=$value"
+}
+
+find_clawdbot_config() {
+    local configured="${SKILL_HUB_CLAWDBOT_CONFIG:-}"
+    if [ -n "$configured" ] && [ -f "$configured" ]; then
+        echo "$configured"
+        return 0
+    fi
+
+    local candidates=(
+        "$HOME/.clawdbot/config/clawdbot.json"
+        "$HOME/.clawdbot/clawdbot.json"
+    )
+
+    local project_dir=$(get_setting "project_dir" "")
+    if [ -n "$project_dir" ]; then
+        candidates+=(
+            "$project_dir/clawd-workspace/config/clawdbot.json"
+            "$project_dir/clawd/config/clawdbot.json"
+            "$project_dir/clawdbot/config/clawdbot.json"
+        )
+    fi
+
+    local candidate=""
+    for candidate in "${candidates[@]}"; do
+        if [ -f "$candidate" ]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+
+    if [ -n "$project_dir" ] && command -v find &>/dev/null; then
+        local found
+        found=$(find "$project_dir" -maxdepth 4 -type f -path "*/config/clawdbot.json" -print -quit 2>/dev/null)
+        [ -n "$found" ] && echo "$found" && return 0
+    fi
+
+    return 1
+}
+
+discover_clawdbot_agents() {
+    local config_path=$1
+    [ -z "$config_path" ] && return 0
+
+    if ! command -v python3 &>/dev/null; then
+        echo "WARN: python3 not found; skipping clawdbot agent discovery" >&2
+        return 0
+    fi
+
+    python3 - "$config_path" <<'PY'
+import json
+import os
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(0)
+
+agents = data.get("agents", {})
+defaults = agents.get("defaults", {})
+default_workspace = defaults.get("workspace")
+seen = set()
+
+for entry in agents.get("list", []) or []:
+    agent_id = entry.get("id") or entry.get("name")
+    if not agent_id:
+        continue
+    workspace = entry.get("workspace") or default_workspace
+    if not workspace:
+        continue
+    workspace = os.path.expanduser(workspace)
+    if not os.path.isabs(workspace):
+        workspace = os.path.abspath(os.path.join(os.path.dirname(path), workspace))
+    name = f"clawdbot-{agent_id}"
+    if name in seen:
+        continue
+    seen.add(name)
+    print(f"{name}:{workspace}/skills")
+PY
+}
+
+discover_agents() {
+    [ "$DISCOVERY_DONE" = true ] && return 0
+    DISCOVERY_DONE=true
+
+    local config_path
+    config_path=$(find_clawdbot_config) || return 0
+
+    local discovered
+    discovered=$(discover_clawdbot_agents "$config_path") || return 0
+    [ -z "$discovered" ] && return 0
+
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    touch "$CONFIG_FILE"
+
+    local added=0
+    local updated=0
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        IFS=: read -r name path <<< "$line"
+        path="${path/#\~/$HOME}"
+
+        # Check if agent already exists
+        local existing_line
+        existing_line=$(grep "^${name}:" "$CONFIG_FILE" 2>/dev/null) || true
+
+        if [ -n "$existing_line" ]; then
+            # Agent exists - check if path changed
+            local existing_path
+            existing_path=$(echo "$existing_line" | cut -d: -f2)
+            existing_path="${existing_path/#\~/$HOME}"
+
+            if [ "$existing_path" != "$path" ]; then
+                # Path changed - update it, preserving skills
+                local existing_skills
+                existing_skills=$(echo "$existing_line" | cut -d: -f3-)
+                existing_skills="${existing_skills:-all}"
+
+                local tmp=$(mktemp)
+                grep -v "^${name}:" "$CONFIG_FILE" > "$tmp"
+                mv "$tmp" "$CONFIG_FILE"
+                echo "${name}:${path}:${existing_skills}" >> "$CONFIG_FILE"
+                echo "Updated $name path: $existing_path -> $path"
+                updated=$((updated + 1))
+            fi
+            continue
+        fi
+
+        # New agent - add it
+        if [ "$added" -eq 0 ] && [ "$updated" -eq 0 ]; then
+            echo "" >> "$CONFIG_FILE"
+            echo "# Discovered from clawdbot.json ($config_path)" >> "$CONFIG_FILE"
+        fi
+        echo "${name}:${path}:all" >> "$CONFIG_FILE"
+        added=$((added + 1))
+    done <<< "$discovered"
+
+    if [ "$added" -gt 0 ]; then
+        echo "Discovered $added clawdbot agent(s) from $config_path"
+    fi
 }
 
 init_skill_hub() {
@@ -314,6 +465,100 @@ get_all_skills() {
     done
 }
 
+strip_ansi() {
+    sed -E 's/\x1b\\[[0-9;]*m//g'
+}
+
+label_to_skill() {
+    local label=$1
+    local clean
+    clean=$(printf '%s' "$label" | strip_ansi)
+    clean="${clean% (upstream -> clawdbot)}"
+    echo "$clean" | sed 's/^ *//; s/ *$//'
+}
+
+list_has_line() {
+    local list=$1
+    local item=$2
+    printf '%s\n' "$list" | grep -Fqx "$item"
+}
+
+unique_lines() {
+    awk '!seen[$0]++'
+}
+
+skills_csv_to_lines() {
+    echo "$1" | tr ',' '\n' | sed 's/^ *//; s/ *$//' | sed '/^$/d'
+}
+
+skills_to_lines() {
+    local skills=$1
+    if [ "$skills" = "all" ]; then
+        get_all_skills
+    else
+        skills_csv_to_lines "$skills"
+    fi
+}
+
+is_clawdbot_subagent() {
+    [[ "$1" == clawdbot-* ]] && [ "$1" != "clawdbot" ]
+}
+
+get_upstream_skills() {
+    local agent=$1
+    if ! is_clawdbot_subagent "$agent"; then
+        return 0
+    fi
+
+    local upstream
+    upstream=$(get_agent_skills "clawdbot" 2>/dev/null || true)
+    [ -z "$upstream" ] && return 0
+
+    # TODO: Extend inherited-skill handling to claude-code/codex project agents in a future release.
+    skills_to_lines "$upstream"
+}
+
+filter_skills_excluding() {
+    local all_skills=$1
+    local exclude_skills=$2
+
+    if [ -z "$exclude_skills" ]; then
+        printf '%s\n' "$all_skills"
+        return 0
+    fi
+
+    while IFS= read -r skill; do
+        [ -z "$skill" ] && continue
+        if ! printf '%s\n' "$exclude_skills" | grep -Fqx "$skill"; then
+            echo "$skill"
+        fi
+    done <<< "$all_skills"
+}
+
+lines_to_csv() {
+    printf '%s\n' "$1" | sed '/^$/d' | tr '\n' ',' | sed 's/,$//'
+}
+
+remove_skill_from_lines() {
+    local list=$1
+    local skill=$2
+    printf '%s\n' "$list" | grep -Fvx "$skill"
+}
+
+add_skill_to_lines() {
+    local list=$1
+    local skill=$2
+    if list_has_line "$list" "$skill"; then
+        printf '%s\n' "$list"
+        return 0
+    fi
+    if [ -z "$list" ]; then
+        echo "$skill"
+    else
+        printf '%s\n%s\n' "$list" "$skill"
+    fi
+}
+
 list_skills() {
     echo "Skills in hub ($SKILL_HUB):"
     echo ""
@@ -356,6 +601,7 @@ parse_config_line() {
 }
 
 status() {
+    discover_agents
     echo "=== Skill Hub ==="
     echo "$SKILL_HUB"
     echo ""
@@ -396,6 +642,44 @@ sync_agent() {
 
     echo "Syncing $name..."
 
+    # Check for local (non-symlinked) skills that might be lost
+    local local_skills=()
+    if [ -d "$path" ] && [ ! -L "$path" ]; then
+        for skill_dir in "$path"/*/; do
+            [ -d "$skill_dir" ] || continue
+            local skill=$(basename "$skill_dir")
+            [[ "$skill" == .* ]] && continue
+            if [ ! -L "${skill_dir%/}" ]; then
+                local_skills+=("$skill")
+            fi
+        done
+
+        if [ ${#local_skills[@]} -gt 0 ]; then
+            echo "  WARNING: Found ${#local_skills[@]} local skill(s) not managed by skill-hub:"
+            for s in "${local_skills[@]}"; do
+                echo "    - $s"
+            done
+            echo ""
+            echo "  These may be overwritten or lost. Consider running first:"
+            echo "    skill-hub local $name"
+            echo "    skill-hub adopt $name <skill>"
+            echo ""
+            if command -v gum &>/dev/null; then
+                if ! gum confirm "Continue with sync anyway?"; then
+                    echo "  Sync cancelled."
+                    return 1
+                fi
+            else
+                echo -n "  Continue with sync? [y/N] "
+                read -r answer
+                if [[ ! "$answer" =~ ^[Yy] ]]; then
+                    echo "  Sync cancelled."
+                    return 1
+                fi
+            fi
+        fi
+    fi
+
     if [ "$skills" = "all" ]; then
         # Full directory symlink mode
         if [ -L "$path" ]; then
@@ -405,11 +689,11 @@ sync_agent() {
                 return 0
             else
                 echo "  Updating symlink..."
-                rm "$path"
+                trash_path "$path" || return 1
             fi
         elif [ -d "$path" ]; then
             echo "  Converting to directory symlink..."
-            rm -rf "$path"
+            trash_path "$path" || return 1
         fi
 
         mkdir -p "$(dirname "$path")"
@@ -419,7 +703,7 @@ sync_agent() {
         # Individual skill symlinks mode
         if [ -L "$path" ]; then
             echo "  Converting from directory symlink to individual..."
-            rm "$path"
+            trash_path "$path" || return 1
         fi
 
         mkdir -p "$path"
@@ -442,9 +726,10 @@ sync_agent() {
                     echo "  $skill: ok"
                     continue
                 fi
-                rm "$dst"
+                trash_path "$dst" || return 1
             elif [ -e "$dst" ]; then
-                echo "  WARN: $skill exists but is not a symlink, skipping"
+                echo "  WARN: $skill exists locally (not a symlink)"
+                echo "        Run 'skill-hub adopt $name $skill' to import it first"
                 continue
             fi
 
@@ -456,6 +741,8 @@ sync_agent() {
 
 sync_all() {
     local filter=$1
+
+    discover_agents
 
     [ ! -f "$CONFIG_FILE" ] && echo "No config file at $CONFIG_FILE" && return 1
 
@@ -476,6 +763,25 @@ trash_path() {
         return 0
     fi
 
+    # Linux: use trash-put if available
+    if [[ "$(uname)" == "Linux" ]]; then
+        if command -v trash-put &>/dev/null; then
+            trash-put "$path"
+            return 0
+        elif command -v gio &>/dev/null; then
+            gio trash "$path"
+            return 0
+        fi
+        # Fallback: create ~/.Trash if needed
+        local trash_dir="$HOME/.Trash"
+        mkdir -p "$trash_dir"
+        local base=$(basename "$path")
+        local stamp=$(date +"%Y%m%d-%H%M%S")
+        mv "$path" "$trash_dir/${base}.${stamp}.$$"
+        return 0
+    fi
+
+    # macOS: use ~/.Trash
     local trash_dir="$HOME/.Trash"
     if [ ! -d "$trash_dir" ]; then
         echo "Error: Trash directory not found; cannot remove $path safely."
@@ -574,6 +880,8 @@ uninstall_agent() {
 uninstall_all() {
     local filter=$1
 
+    discover_agents
+
     [ ! -f "$CONFIG_FILE" ] && echo "No config file at $CONFIG_FILE" && return 1
 
     while IFS= read -r line || [ -n "$line" ]; do
@@ -620,7 +928,9 @@ link_project() {
         mv "$skill_path" "$skill_path.bak"
     fi
 
-    [ -L "$skill_path" ] && rm "$skill_path"
+    if [ -L "$skill_path" ]; then
+        trash_path "$skill_path" || return 1
+    fi
 
     ln -s "$project_path" "$skill_path"
     echo "Linked $skill -> $project_path"
@@ -777,7 +1087,7 @@ migrate_skill() {
     fi
 
     # Remove original and create symlink to repo root
-    rm -rf "$skill_path"
+    trash_path "$skill_path" || return 1
     ln -s "$target_path" "$skill_path"
 
     echo ""
@@ -792,6 +1102,183 @@ migrate_skill() {
     else
         echo "  git init && git add -A && git commit -m 'Initial commit'"
     fi
+}
+
+# List local (non-symlinked) skills in an agent's workspace
+list_local_skills() {
+    local agent=$1
+
+    local path=$(get_agent_path "$agent")
+    if [ -z "$path" ]; then
+        echo "Error: Agent '$agent' not found"
+        return 1
+    fi
+
+    if [ ! -d "$path" ]; then
+        echo "Agent skills directory does not exist: $path"
+        return 1
+    fi
+
+    echo "Local skills in $agent ($path):"
+    echo ""
+
+    local found=0
+    for skill_dir in "$path"/*/; do
+        [ -d "$skill_dir" ] || continue
+        local skill=$(basename "$skill_dir")
+        [[ "$skill" == .* ]] && continue
+
+        # Check if it's a symlink
+        if [ -L "${skill_dir%/}" ]; then
+            continue  # Skip symlinks - they're managed by skill-hub
+        fi
+
+        # It's a local directory - candidate for adoption
+        found=$((found + 1))
+        local has_skill_md=""
+        if [ -f "$skill_dir/SKILL.md" ]; then
+            has_skill_md="[has SKILL.md]"
+        else
+            has_skill_md="[no SKILL.md]"
+        fi
+
+        # Check if skill already exists in hub
+        local in_hub=""
+        if [ -d "$SKILL_HUB/$skill" ] || [ -L "$SKILL_HUB/$skill" ]; then
+            in_hub="(exists in hub)"
+        fi
+
+        printf "  %-25s %s %s\n" "$skill" "$has_skill_md" "$in_hub"
+    done
+
+    if [ "$found" -eq 0 ]; then
+        echo "  (no local skills found - all are symlinked)"
+    else
+        echo ""
+        echo "Found $found local skill(s). To import into skill-hub:"
+        echo "  skill-hub adopt $agent <skill>"
+    fi
+}
+
+# Adopt a skill from an agent's workspace into skill-hub
+adopt_skill() {
+    local agent=$1
+    local skill=$2
+
+    local agent_path=$(get_agent_path "$agent")
+    if [ -z "$agent_path" ]; then
+        echo "Error: Agent '$agent' not found"
+        return 1
+    fi
+
+    local skill_path="$agent_path/$skill"
+
+    # Verify skill exists
+    if [ ! -d "$skill_path" ]; then
+        echo "Error: Skill '$skill' not found in $agent's workspace"
+        echo "  Expected: $skill_path"
+        return 1
+    fi
+
+    # Check it's not already a symlink
+    if [ -L "$skill_path" ]; then
+        local target=$(readlink "$skill_path")
+        echo "Skill '$skill' is already a symlink:"
+        echo "  $skill_path -> $target"
+        return 1
+    fi
+
+    # Check if SKILL.md exists
+    if [ ! -f "$skill_path/SKILL.md" ]; then
+        echo "Warning: $skill_path/SKILL.md not found"
+        echo "Skills should have a SKILL.md file with frontmatter."
+        echo ""
+        if command -v gum &>/dev/null; then
+            if ! gum confirm "Continue anyway?"; then
+                return 1
+            fi
+        else
+            echo -n "Continue anyway? [y/N] "
+            read -r answer
+            if [[ ! "$answer" =~ ^[Yy] ]]; then
+                return 1
+            fi
+        fi
+    fi
+
+    local hub_skill_path="$SKILL_HUB/$skill"
+
+    # Check if skill already exists in hub
+    if [ -d "$hub_skill_path" ] || [ -L "$hub_skill_path" ]; then
+        echo "Skill '$skill' already exists in skill-hub."
+        echo ""
+        echo "Options:"
+        echo "  1. Replace hub version with agent's version"
+        echo "  2. Just symlink agent to existing hub version (discard agent's)"
+        echo "  3. Cancel"
+        echo ""
+
+        local choice=""
+        if command -v gum &>/dev/null; then
+            choice=$(gum choose "Replace hub version" "Symlink to hub (discard local)" "Cancel")
+        else
+            echo -n "Choice [1/2/3]: "
+            read -r answer
+            case "$answer" in
+                1) choice="Replace hub version" ;;
+                2) choice="Symlink to hub (discard local)" ;;
+                *) choice="Cancel" ;;
+            esac
+        fi
+
+        case "$choice" in
+            "Replace hub version")
+                echo "Replacing hub version..."
+                trash_path "$hub_skill_path" || return 1
+                ;;
+            "Symlink to hub (discard local)")
+                echo "Replacing local with symlink to hub..."
+                trash_path "$skill_path" || return 1
+                ln -s "$hub_skill_path" "$skill_path"
+                echo "Done: $skill_path -> $hub_skill_path"
+                return 0
+                ;;
+            *)
+                echo "Cancelled."
+                return 1
+                ;;
+        esac
+    fi
+
+    echo "Adopting '$skill' from $agent into skill-hub..."
+    echo "  From: $skill_path"
+    echo "  To:   $hub_skill_path"
+    echo ""
+
+    # Copy to hub
+    cp -r "$skill_path" "$hub_skill_path"
+
+    # Replace local with symlink
+    trash_path "$skill_path" || return 1
+    ln -s "$hub_skill_path" "$skill_path"
+
+    echo "Adoption complete!"
+    echo "  Hub:     $hub_skill_path"
+    echo "  Symlink: $skill_path -> $hub_skill_path"
+    echo ""
+
+    # Update agent config if needed
+    local current_skills=$(get_agent_skills "$agent")
+    if [ "$current_skills" != "all" ]; then
+        if ! echo ",$current_skills," | grep -q ",$skill,"; then
+            echo "Adding '$skill' to $agent's skill list..."
+            enable_skill "$agent" "$skill"
+        fi
+    fi
+
+    echo ""
+    echo "The skill is now centrally managed. Other agents can use it with:"
+    echo "  skill-hub enable <agent> $skill"
 }
 
 #================================================================================
@@ -1095,6 +1582,7 @@ preset_delete() {
 # Get current skills for an agent
 get_agent_skills() {
     local agent=$1
+    discover_agents
     while IFS= read -r line || [ -n "$line" ]; do
         parsed=$(parse_config_line "$line") || continue
         IFS=: read -r name path skills <<< "$parsed"
@@ -1110,6 +1598,7 @@ get_agent_skills() {
 # Get agent path
 get_agent_path() {
     local agent=$1
+    discover_agents
     while IFS= read -r line || [ -n "$line" ]; do
         parsed=$(parse_config_line "$line") || continue
         IFS=: read -r name path skills <<< "$parsed"
@@ -1263,6 +1752,62 @@ reset_agent() {
     set_agent_skills "$agent" "all"
 }
 
+move_skill_between_agents() {
+    local skill=$1
+    local from_agent=$2
+    local to_agent=$3
+
+    if [ -z "$skill" ] || [ -z "$from_agent" ] || [ -z "$to_agent" ]; then
+        echo "Usage: move-skill <skill> <from-agent> <to-agent>"
+        return 1
+    fi
+
+    if [ ! -d "$SKILL_HUB/$skill" ]; then
+        echo "Error: Skill '$skill' not found in hub"
+        return 1
+    fi
+
+    local from_skills=$(get_agent_skills "$from_agent")
+    if [ -z "$from_skills" ]; then
+        echo "Error: Agent '$from_agent' not found"
+        return 1
+    fi
+
+    local to_skills=$(get_agent_skills "$to_agent")
+    if [ -z "$to_skills" ]; then
+        echo "Error: Agent '$to_agent' not found"
+        return 1
+    fi
+
+    local from_lines=$(skills_to_lines "$from_skills")
+    if ! list_has_line "$from_lines" "$skill"; then
+        echo "Error: $skill is not enabled for $from_agent"
+        return 1
+    fi
+
+    local updated_from=$(remove_skill_from_lines "$from_lines" "$skill")
+    if [ -z "$updated_from" ]; then
+        echo "Error: Cannot remove last skill from $from_agent"
+        return 1
+    fi
+
+    local updated_to="$to_skills"
+    if [ "$to_skills" != "all" ]; then
+        local to_lines=$(skills_to_lines "$to_skills")
+        updated_to=$(lines_to_csv "$(add_skill_to_lines "$to_lines" "$skill")")
+    fi
+
+    local updated_from_csv=$(lines_to_csv "$updated_from")
+
+    echo "Moving $skill from $from_agent to $to_agent..."
+    set_agent_skills "$from_agent" "$updated_from_csv"
+    if [ "$to_skills" != "all" ]; then
+        set_agent_skills "$to_agent" "$updated_to"
+    else
+        echo "$to_agent already has all skills; no change needed"
+    fi
+}
+
 #================================================================================
 # Interactive TUI (requires gum)
 #================================================================================
@@ -1273,6 +1818,8 @@ interactive() {
         echo "Install with: brew install gum"
         return 1
     fi
+
+    discover_agents
 
     while true; do
         # Build agent list
@@ -1286,6 +1833,7 @@ interactive() {
         # Main menu
         local action=$(gum choose --header "Skill Hub - What would you like to do?" \
             "Configure agent" \
+            "Move skill between agents" \
             "Manage skills" \
             "Apply preset" \
             "Create preset" \
@@ -1365,45 +1913,231 @@ interactive() {
                 local agent=$(gum choose --header "Select agent to configure:" "${agents[@]}")
                 [ -z "$agent" ] && continue
 
-                local current=$(get_agent_skills "$agent")
-                local all_skills=$(get_all_skills)
+                while true; do
+                    local current=$(get_agent_skills "$agent")
+                    local all_skills=$(get_all_skills)
+                    local upstream_skills=$(get_upstream_skills "$agent")
+                    local current_lines=$(skills_to_lines "$current")
+                    local selected_display=$(printf '%s\n%s\n' "$current_lines" "$upstream_skills" | sed '/^$/d' | unique_lines)
 
-                # Build list of currently enabled skills for --selected
-                local enabled_skills=""
-                if [ "$current" = "all" ]; then
-                    enabled_skills="$all_skills"
-                else
-                    enabled_skills=$(echo "$current" | tr ',' '\n')
+                    if [ -z "$all_skills" ]; then
+                        echo "No skills found in hub."
+                        gum confirm "Press enter to continue" --affirmative="OK" --negative=""
+                        break
+                    fi
+
+                    local selected_in_order=""
+                    local unselected_in_order=""
+                    while IFS= read -r skill; do
+                        [ -z "$skill" ] && continue
+                        if list_has_line "$selected_display" "$skill"; then
+                            selected_in_order+="$skill"$'\n'
+                        else
+                            unselected_in_order+="$skill"$'\n'
+                        fi
+                    done <<< "$all_skills"
+
+                    local ordered_skills=$(printf '%s%s' "$selected_in_order" "$unselected_in_order" | sed '/^$/d')
+                    local selected_count=$(printf '%s' "$selected_in_order" | sed '/^$/d' | wc -l | tr -d ' ')
+
+                    local header="Skills for $agent (TAB to toggle, ENTER to confirm)"
+                    if [ -n "$upstream_skills" ]; then
+                        header=$'Skills for '"$agent"$' (TAB to toggle, ENTER to confirm)\nUpstream skills are locked and marked \"(upstream -> clawdbot)\".'
+                    fi
+
+                    if command -v fzf &>/dev/null; then
+                        local list_input=""
+                        while IFS= read -r skill; do
+                            [ -z "$skill" ] && continue
+                            local label="$skill"
+                            if list_has_line "$upstream_skills" "$skill"; then
+                                label=$'\033[90m'"$skill (upstream -> clawdbot)"$'\033[0m'
+                            fi
+                            list_input+="${skill}"$'\t'"${label}"$'\n'
+                        done <<< "$ordered_skills"
+
+                        local bind=""
+                        if [ "$selected_count" -gt 0 ]; then
+                            bind="start:toggle"
+                            local i=1
+                            while [ "$i" -lt "$selected_count" ]; do
+                                bind+="+down+toggle"
+                                i=$((i + 1))
+                            done
+                        fi
+
+                        local new_selection=""
+                        if [ -n "$bind" ]; then
+                            new_selection=$(printf '%s' "$list_input" | fzf --multi --ansi --delimiter $'\t' --with-nth=2 --accept-nth=1 --header "$header" --marker="✓" --pointer="> " --bind "$bind")
+                        else
+                            new_selection=$(printf '%s' "$list_input" | fzf --multi --ansi --delimiter $'\t' --with-nth=2 --accept-nth=1 --header "$header" --marker="✓" --pointer="> ")
+                        fi
+                        local choose_status=$?
+
+                        if [ "$choose_status" -ne 0 ]; then
+                            local cancel_choice=$(gum choose --header "Cancel changes to $agent?" \
+                                "Cancel without saving" \
+                                "Continue editing")
+                            if [ "$cancel_choice" = "Cancel without saving" ]; then
+                                break
+                            fi
+                            continue
+                        fi
+
+                        local selected_lines=$(printf '%s\n' "$new_selection" | sed '/^$/d')
+                        if [ -n "$upstream_skills" ]; then
+                            selected_lines=$(filter_skills_excluding "$selected_lines" "$upstream_skills")
+                        fi
+
+                        if [ -n "$selected_lines" ]; then
+                            local new_skills=$(lines_to_csv "$selected_lines")
+                            set_agent_skills "$agent" "$new_skills"
+                        else
+                            local choice
+                            if [ -n "$upstream_skills" ]; then
+                                choice=$(gum choose --header "No skills selected. What would you like to do?" \
+                                    "Enable all selectable skills" \
+                                    "Keep current configuration" \
+                                    "Cancel")
+                                case "$choice" in
+                                    "Enable all selectable skills")
+                                        local all_selectable=$(filter_skills_excluding "$all_skills" "$upstream_skills")
+                                        local all_selectable_csv=$(lines_to_csv "$all_selectable")
+                                        set_agent_skills "$agent" "$all_selectable_csv"
+                                        ;;
+                                    *)
+                                        echo "Configuration unchanged."
+                                        ;;
+                                esac
+                            else
+                                choice=$(gum choose --header "No skills selected. What would you like to do?" \
+                                    "Set to all skills" \
+                                    "Keep current configuration" \
+                                    "Cancel")
+                                case "$choice" in
+                                    "Set to all skills")
+                                        reset_agent "$agent"
+                                        ;;
+                                    *)
+                                        echo "Configuration unchanged."
+                                        ;;
+                                esac
+                            fi
+                        fi
+                        break
+                    fi
+
+                    # Fallback: gum choose (space to toggle)
+                    local gum_header="Skills for $agent (space to toggle, enter to confirm)"
+                    if [ -n "$upstream_skills" ]; then
+                        gum_header=$'Skills for '"$agent"$' (space to toggle, enter to confirm)\nUpstream skills are locked and marked \"(upstream -> clawdbot)\".'
+                    fi
+
+                    local skill_labels=""
+                    local selected_labels=""
+                    while IFS= read -r skill; do
+                        [ -z "$skill" ] && continue
+                        local label="$skill"
+                        if list_has_line "$upstream_skills" "$skill"; then
+                            label=$'\033[90m'"$skill (upstream -> clawdbot)"$'\033[0m'
+                        fi
+                        skill_labels+="$label"$'\n'
+                        if list_has_line "$selected_display" "$skill"; then
+                            selected_labels+="$label"$'\n'
+                        fi
+                    done <<< "$all_skills"
+
+                    local selected_arg=$(lines_to_csv "$selected_labels")
+                    local new_selection=$(printf '%s' "$skill_labels" | gum choose --no-limit --selected="$selected_arg" --header "$gum_header" --no-strip-ansi)
+                    local choose_status=$?
+
+                    if [ "$choose_status" -ne 0 ]; then
+                        local cancel_choice=$(gum choose --header "Cancel changes to $agent?" \
+                            "Cancel without saving" \
+                            "Continue editing")
+                        if [ "$cancel_choice" = "Cancel without saving" ]; then
+                            break
+                        fi
+                        continue
+                    fi
+
+                    local selected_lines=""
+                    while IFS= read -r label; do
+                        [ -z "$label" ] && continue
+                        selected_lines+=$(label_to_skill "$label")$'\n'
+                    done <<< "$new_selection"
+                    selected_lines=$(printf '%s' "$selected_lines" | sed '/^$/d')
+
+                    if [ -n "$upstream_skills" ]; then
+                        selected_lines=$(filter_skills_excluding "$selected_lines" "$upstream_skills")
+                    fi
+
+                    if [ -n "$selected_lines" ]; then
+                        local new_skills=$(lines_to_csv "$selected_lines")
+                        set_agent_skills "$agent" "$new_skills"
+                    else
+                        local choice
+                        if [ -n "$upstream_skills" ]; then
+                            choice=$(gum choose --header "No skills selected. What would you like to do?" \
+                                "Enable all selectable skills" \
+                                "Keep current configuration" \
+                                "Cancel")
+                            case "$choice" in
+                                "Enable all selectable skills")
+                                    local all_selectable=$(filter_skills_excluding "$all_skills" "$upstream_skills")
+                                    local all_selectable_csv=$(lines_to_csv "$all_selectable")
+                                    set_agent_skills "$agent" "$all_selectable_csv"
+                                    ;;
+                                *)
+                                    echo "Configuration unchanged."
+                                    ;;
+                            esac
+                        else
+                            choice=$(gum choose --header "No skills selected. What would you like to do?" \
+                                "Set to all skills" \
+                                "Keep current configuration" \
+                                "Cancel")
+                            case "$choice" in
+                                "Set to all skills")
+                                    reset_agent "$agent"
+                                    ;;
+                                *)
+                                    echo "Configuration unchanged."
+                                    ;;
+                            esac
+                        fi
+                    fi
+                    break
+                done
+                ;;
+            "Move skill between agents")
+                local from_agent=$(gum choose --header "Move skill from which agent?" "${agents[@]}")
+                [ -z "$from_agent" ] && continue
+                local to_candidates=()
+                local agent_name=""
+                for agent_name in "${agents[@]}"; do
+                    [ "$agent_name" = "$from_agent" ] && continue
+                    to_candidates+=("$agent_name")
+                done
+                local to_agent=$(gum choose --header "Move skill to which agent?" "${to_candidates[@]}")
+                [ -z "$to_agent" ] && continue
+
+                local from_skills=$(get_agent_skills "$from_agent")
+                local available_skills=$(skills_to_lines "$from_skills")
+                if [ "$from_skills" = "all" ]; then
+                    available_skills=$(get_all_skills)
                 fi
 
-                # Convert to comma-separated for gum --selected
-                local selected_arg=$(echo "$enabled_skills" | tr '\n' ',' | sed 's/,$//')
-
-                echo ""
-                echo "Select skills for $agent (space to toggle, enter to confirm):"
-                echo ""
-
-                # Multi-select with current state pre-selected
-                local new_selection=$(echo "$all_skills" | gum choose --no-limit --selected="$selected_arg" --header "Skills for $agent (✓ = enabled):")
-
-                if [ -n "$new_selection" ]; then
-                    local new_skills=$(echo "$new_selection" | tr '\n' ',' | sed 's/,$//')
-                    set_agent_skills "$agent" "$new_skills"
-                else
-                    # Empty selection - ask if they want all or none
-                    local choice=$(gum choose --header "No skills selected. What would you like to do?" \
-                        "Set to all skills" \
-                        "Keep current configuration" \
-                        "Cancel")
-                    case "$choice" in
-                        "Set to all skills")
-                            reset_agent "$agent"
-                            ;;
-                        *)
-                            echo "Configuration unchanged."
-                            ;;
-                    esac
+                if [ -z "$available_skills" ]; then
+                    echo "No skills available to move from $from_agent."
+                    gum confirm "Press enter to continue" --affirmative="OK" --negative=""
+                    continue
                 fi
+
+                local skill=$(echo "$available_skills" | gum choose --header "Select a skill to move to $to_agent:")
+                [ -z "$skill" ] && continue
+                move_skill_between_agents "$skill" "$from_agent" "$to_agent"
+                gum confirm "Press enter to continue" --affirmative="OK" --negative=""
                 ;;
             "Apply preset")
                 if [ ! -f "$PRESETS_FILE" ]; then
@@ -1460,6 +2194,9 @@ case "${1:-}" in
         fi
         skill_info "$2"
         ;;
+    discover)
+        discover_agents
+        ;;
     sync)
         sync_all "${2:-}"
         ;;
@@ -1498,6 +2235,28 @@ case "${1:-}" in
         fi
         migrate_skill "$2" "${3:-}"
         ;;
+    local)
+        if [ -z "${2:-}" ]; then
+            echo "Usage: skill-hub local <agent>"
+            echo ""
+            echo "Lists local (non-symlinked) skills in an agent's workspace."
+            echo "These are candidates for adoption into skill-hub."
+            exit 1
+        fi
+        list_local_skills "$2"
+        ;;
+    adopt)
+        if [ -z "${2:-}" ] || [ -z "${3:-}" ]; then
+            echo "Usage: skill-hub adopt <agent> <skill>"
+            echo ""
+            echo "Imports a skill from an agent's workspace into skill-hub."
+            echo "The local copy is replaced with a symlink to the hub."
+            echo ""
+            echo "To see adoptable skills: skill-hub local <agent>"
+            exit 1
+        fi
+        adopt_skill "$2" "$3"
+        ;;
     config)
         config_cmd "${2:-}" "${3:-}"
         ;;
@@ -1529,6 +2288,13 @@ case "${1:-}" in
             exit 1
         fi
         copy_agent "$2" "$3"
+        ;;
+    move-skill)
+        if [ -z "${2:-}" ] || [ -z "${3:-}" ] || [ -z "${4:-}" ]; then
+            echo "Usage: skill-hub move-skill <skill> <from-agent> <to-agent>"
+            exit 1
+        fi
+        move_skill_between_agents "$2" "$3" "$4"
         ;;
     reset)
         if [ -z "${2:-}" ]; then
